@@ -71,20 +71,28 @@ async def handle_resume_dialog(page: Page) -> None:
         # Check if resume dialog appears (with short timeout)
         resume_btn = page.get_by_role("button", name="Commencer à partir du CV Europass")
         
-        if await resume_btn.is_visible():
-            await resume_btn.click()
-            logger.info("  Dismissed 'Resume last CV' prompt")
-            
-            # Wait for and click Continue
-            continue_btn = page.get_by_role("button", name="Continuer")
-            try:
-                await continue_btn.wait_for(state="visible", timeout=5000)
-                await continue_btn.click()
-                logger.info("  Clicked 'Continuer'")
-            except PlaywrightTimeout:
-                pass  # No continue button needed
-    except:
-        pass  # No resume dialog present
+        try:
+            await resume_btn.wait_for(state="visible", timeout=3000)
+        except PlaywrightTimeout:
+            return  # No dialog present
+        
+        await resume_btn.click()
+        logger.info("  Dismissed 'Resume last CV' prompt")
+        
+        # Wait for page to stabilize after click
+        await wait_for_network_idle(page, timeout=5000)
+        
+        # Wait for and click Continue if it appears
+        continue_btn = page.get_by_role("button", name="Continuer")
+        try:
+            await continue_btn.wait_for(state="visible", timeout=3000)
+            await continue_btn.click()
+            logger.info("  Clicked 'Continuer'")
+            await wait_for_network_idle(page, timeout=5000)
+        except PlaywrightTimeout:
+            pass  # No continue button needed
+    except Exception as e:
+        logger.debug(f"  No resume dialog or error: {e}")
 
 
 async def upload_xml_file(page: Page, xml_path: Path, timeout: int) -> bool:
@@ -270,24 +278,60 @@ async def generate_europass_pdf(
             builder_btn = page.get_by_role("button", name="Try the new CV builder (beta)")
             await builder_btn.click()
             
+            # Handle "Continuer" dialog if it appears (for resume confirmation)
+            try:
+                continue_btn = page.get_by_role("button", name="Continuer")
+                await continue_btn.wait_for(state="visible", timeout=3000)
+                await continue_btn.click()
+                logger.info("  Clicked 'Continuer' to confirm")
+                await asyncio.sleep(1)
+            except PlaywrightTimeout:
+                pass
+            
             # Wait for URL change (poll instead of hardcoded wait)
             await page.wait_for_url("**/compact-cv-editor**", timeout=timeout)
             await wait_for_network_idle(page)
             
-            # Step 5: Select template
+            # Handle error dialog if present (e.g., validation warnings)
+            try:
+                ok_btn = page.get_by_role("button", name="OK")
+                await ok_btn.wait_for(state="visible", timeout=3000)
+                await ok_btn.click()
+                logger.info("  Dismissed validation dialog")
+            except PlaywrightTimeout:
+                pass
+            
+            # Step 5: Select template by value (not index - order may change)
             logger.info(f"5/7 Selecting template: {template}...")
+            await asyncio.sleep(1)  # Let the page stabilize
+            
+            # Select by value - stable regardless of option order
             template_select = page.locator("select.ecl-select").first
-            await template_select.wait_for(state="visible", timeout=timeout)
+            await template_select.wait_for(state="visible", timeout=10000)
             await template_select.select_option(value=TEMPLATES[template])
+            logger.info(f"  ✓ Selected template: {template}")
             
-            # Step 6: Enter CV name and wait for preview
-            logger.info("6/7 Configuring and rendering...")
-            name_input = page.get_by_role("textbox", name="Nom")
-            await name_input.wait_for(state="visible", timeout=timeout)
+            # Wait for template to apply and preview to regenerate
+            await asyncio.sleep(3)
+            
+            # Step 6: Enter CV name (REQUIRED before download)
+            logger.info("6/7 Entering CV name...")
+            name_input = page.get_by_role("textbox").first
+            await name_input.wait_for(state="visible", timeout=5000)
+            await name_input.click()
             await name_input.fill(output_path.stem)
+            await name_input.press("Tab")  # Trigger blur/validation
+            logger.info(f"  ✓ CV name set to: {output_path.stem}")
             
-            # Wait for preview to be ready (polling)
+            # Wait for form validation and preview to update after name change
+            await asyncio.sleep(2)
+            
+            # Wait for preview to be fully ready (polling)
+            logger.info("  Waiting for preview to render...")
             await wait_for_preview_ready(page, timeout)
+            
+            # Extra wait for PDF to be ready server-side
+            await asyncio.sleep(2)
             
             # Step 7: Download PDF
             logger.info("7/7 Downloading PDF...")
