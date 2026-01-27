@@ -24,13 +24,13 @@ import logging
 from pathlib import Path
 
 try:
-    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout, expect
 except ImportError:
     print("Installing playwright...")
     import subprocess
     subprocess.run([sys.executable, "-m", "pip", "install", "playwright"])
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
-    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout, expect
 
 # Configure logging
 logging.basicConfig(
@@ -125,26 +125,27 @@ async def upload_xml_file(page: Page, xml_path: Path, timeout: int) -> bool:
 async def wait_for_angular_stable(page: Page, timeout: int = 5000) -> bool:
     """Wait for Angular hydration to complete (event handlers attached).
     
-    Uses __ngContext__ on elements as indicator that Angular has hydrated them.
+    Uses expect.poll (Playwright 1.40+ best practice) to check for Angular
+    context on elements, indicating hydration is complete.
     Works with both Zone.js and zoneless Angular apps.
-    Returns True if hydrated, False on timeout.
     """
     try:
-        await page.wait_for_function(
-            """() => {
-                // Check for Angular context on the download button (hydration indicator)
-                // __ngContext__ is set after Angular hydrates the element
+        # Best practice 2025: use expect.poll for custom conditions
+        await expect(page.locator("button[aria-label='Télécharger']")).to_be_visible(timeout=timeout)
+        
+        # Poll for Angular hydration indicator
+        async def check_hydration():
+            return await page.evaluate("""() => {
                 const btn = document.querySelector("button[aria-label='Télécharger']");
                 return btn && (btn.__ngContext__ !== undefined || btn.hasAttribute('eclbutton'));
-            }""",
-            timeout=timeout
-        )
+            }""")
+        
+        await expect.poll(check_hydration, timeout=timeout).to_be(True)
         return True
-    except PlaywrightTimeout:
+    except (PlaywrightTimeout, AssertionError):
         logger.debug("  Angular hydration check timeout - proceeding anyway")
         return False
     except Exception as e:
-        # Angular zoneless mode may throw errors - ignore and proceed
         logger.debug(f"  Angular check error: {e} - proceeding anyway")
         return False
 
