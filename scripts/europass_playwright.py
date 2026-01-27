@@ -143,18 +143,10 @@ async def wait_for_preview_ready(page: Page, timeout: int = 30000) -> bool:
             except PlaywrightTimeout:
                 pass  # Selector doesn't exist or already hidden
         
-        # Wait for download button to be enabled (indicates preview is ready)
-        download_btn = page.get_by_role("button", name="Télécharger")
+        # Wait for download button to be visible (indicates preview is ready)
+        # Use aria-label selector - more stable than text content
+        download_btn = page.locator("button[aria-label='Télécharger']")
         await download_btn.wait_for(state="visible", timeout=timeout)
-        
-        # Poll until button is not disabled
-        await page.wait_for_function(
-            """() => {
-                const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Télécharger'));
-                return btn && !btn.disabled;
-            }""",
-            timeout=timeout
-        )
         
         logger.info("✓ Preview rendered")
         return True
@@ -166,47 +158,84 @@ async def wait_for_preview_ready(page: Page, timeout: int = 30000) -> bool:
         return False
 
 
+async def wait_for_angular_stable(page: Page, timeout: int = 5000) -> bool:
+    """Wait for Angular hydration to complete (event handlers attached).
+    
+    Uses __ngContext__ on elements as indicator that Angular has hydrated them.
+    Works with both Zone.js and zoneless Angular apps.
+    Returns True if hydrated, False on timeout.
+    """
+    try:
+        await page.wait_for_function(
+            """() => {
+                // Check for Angular context on the download button (hydration indicator)
+                // __ngContext__ is set after Angular hydrates the element
+                const btn = document.querySelector("button[aria-label='Télécharger']");
+                return btn && (btn.__ngContext__ !== undefined || btn.hasAttribute('eclbutton'));
+            }""",
+            timeout=timeout
+        )
+        return True
+    except PlaywrightTimeout:
+        logger.debug("  Angular hydration check timeout - proceeding anyway")
+        return False
+    except Exception as e:
+        # Angular zoneless mode may throw errors - ignore and proceed
+        logger.debug(f"  Angular check error: {e} - proceeding anyway")
+        return False
+
+
 async def download_pdf_with_retry(
     page: Page,
     output_path: Path,
     timeout: int,
-    max_retries: int = 3
+    max_retries: int = 5
 ) -> bool:
-    """Download PDF with retry logic.
+    """Download PDF with retry-action pattern.
     
-    Uses expect_download for proper async download handling.
-    Beta builder needs extra time for server-side PDF generation.
+    Uses Playwright's retry mechanism instead of sleep() to handle
+    Angular hydration timing. Clicks the button and checks for download,
+    retrying with short intervals if the click was "dead" (pre-hydration).
     """
-    download_btn = page.get_by_role("button", name="Télécharger")
+    download_btn = page.locator("button[aria-label='Télécharger']")
+    
+    # First, wait for Angular to stabilize (handlers attached)
+    await wait_for_angular_stable(page, timeout=5000)
+    
+    # Retry-action pattern: click + expect download, retry on failure
+    retry_intervals = [200, 300, 500, 1000, 2000]  # ms between retries
     
     for attempt in range(1, max_retries + 1):
         try:
             await download_btn.wait_for(state="visible", timeout=timeout)
             
-            # Beta builder generates PDF server-side, needs longer timeout
-            download_timeout = timeout * 2  # Double timeout for download
+            # Short timeout for each attempt - we'll retry quickly if it fails
+            attempt_timeout = 5000 if attempt < max_retries else timeout * 2
             
-            async with page.expect_download(timeout=download_timeout) as download_info:
+            async with page.expect_download(timeout=attempt_timeout) as download_info:
                 await download_btn.click()
             
             download = await download_info.value
-            
-            # Wait for download to complete (server-side PDF generation can be slow)
             await download.save_as(output_path)
             
-            # Verify file was created and has content
             if output_path.exists() and output_path.stat().st_size > 0:
+                if attempt > 1:
+                    logger.info(f"  ✓ Download succeeded on attempt {attempt}")
                 return True
             else:
-                logger.warning(f"  Attempt {attempt}: Downloaded file empty or missing")
+                logger.warning(f"  Attempt {attempt}: Downloaded file empty")
                 
         except PlaywrightTimeout:
-            logger.warning(f"  Attempt {attempt}: Download timeout")
+            if attempt < max_retries:
+                interval = retry_intervals[min(attempt - 1, len(retry_intervals) - 1)]
+                logger.debug(f"  Attempt {attempt}: No download, retrying in {interval}ms...")
+                await asyncio.sleep(interval / 1000)
+            else:
+                logger.warning(f"  All {max_retries} attempts failed")
         except Exception as e:
             logger.warning(f"  Attempt {attempt}: {e}")
-        
-        if attempt < max_retries:
-            await asyncio.sleep(2)  # Brief pause before retry
+            if attempt < max_retries:
+                await asyncio.sleep(0.5)
     
     return False
 
@@ -251,7 +280,7 @@ async def generate_europass_pdf(
         context = await browser.new_context(
             accept_downloads=True,
             locale='fr-FR',
-            viewport={'width': 1280, 'height': 900}
+            viewport={'width': 1920, 'height': 1080}  # Full HD to avoid responsive mobile layout
         )
         page = await context.new_page()
         
@@ -316,28 +345,16 @@ async def generate_europass_pdf(
             
             # Step 6: Enter CV name (REQUIRED before download)
             logger.info("6/7 Entering CV name...")
-            name_input = page.get_by_role("textbox").first
+            name_input = page.get_by_role("textbox", name="Nom")
             await name_input.wait_for(state="visible", timeout=5000)
-            await name_input.click()
             await name_input.fill(output_path.stem)
-            await name_input.press("Tab")  # Trigger blur/validation
-            logger.info(f"  ✓ CV name set to: {output_path.stem}")
+            await name_input.press("Enter")  # Validate form input
             
-            # Brief pause for form validation after Tab key
-            await asyncio.sleep(0.5)
+            # Wait for form validation to complete (network activity)
+            await wait_for_network_idle(page, timeout=5000)
+            logger.info(f"  ✓ CV name validated: {output_path.stem}")
             
-            # Poll: wait for download button to be enabled
-            logger.info("  Waiting for preview to render...")
-            await page.wait_for_function(
-                """() => {
-                    const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Télécharger'));
-                    return btn && !btn.disabled && btn.offsetParent !== null;
-                }""",
-                timeout=30000
-            )
-            logger.info("  ✓ Preview ready, download button enabled")
-            
-            # Step 7: Download PDF
+            # Step 7: Download PDF (uses Angular stability check + retry-action pattern)
             logger.info("7/7 Downloading PDF...")
             if not await download_pdf_with_retry(page, output_path, timeout):
                 raise Exception("Failed to download PDF after retries")
