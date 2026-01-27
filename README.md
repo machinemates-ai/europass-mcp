@@ -2,31 +2,40 @@
 
 Staffing and recruiting resources for Guillaume Fortaine — **LangChain Ambassador France**.
 
-## 📁 Files
+## 📁 Project Structure
 
-| File | Description |
-|------|-------------|
-| **CV-Europass-Authentic.odt** | ⭐ Authentic ODT (open in LibreOffice → Export PDF) |
-| **CV-Europass-Enriched-2026.pdf** | Ready-to-use PDF with enriched content |
-| **europass_profile.json** | JSON for official Europass API |
-| **CV-Europass-20250917-Fortaine-FR.pdf** | Original source PDF |
-
-## 🔧 Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `generate_europass_odt.py` | Creates authentic ODT (official Europass approach) |
-| `generate_europass_fpdf.py` | Generates PDF with fpdf2 |
-| `europass_api_client.py` | Generates JSON for Europass ePortfolio API |
+```
+Talent/
+├── input/                    # Source files
+│   ├── europass.xml          # CV data (Europass XML)
+│   └── images/
+│       ├── profile.jpeg
+│       └── lanchainambassador.png
+├── output/                   # Generated files (gitignored)
+│   └── CV-Europass.pdf
+├── src/                      # Python scripts
+│   ├── europass_playwright.py
+│   └── generate_enriched_europass.py
+└── pyproject.toml            # Project config (uv)
+```
 
 ## 🚀 Quick Start
 
 ```bash
-# Generate ODT with authentic Europass styling
-python3 generate_europass_odt.py
+# Install dependencies (uv)
+uv sync
+uv run playwright install chromium
 
-# Generate PDF directly
-uv run --with pypdf,fpdf2 generate_europass_fpdf.py
+# Generate PDF
+uv run python src/europass_playwright.py
+```
+
+## 🔧 Options
+
+```bash
+python src/europass_playwright.py --help
+python src/europass_playwright.py --visible          # Watch browser
+python src/europass_playwright.py --template=cv-elegant
 ```
 
 ## Profile Highlights

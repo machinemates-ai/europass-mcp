@@ -343,23 +343,6 @@ async def generate_europass_pdf(
             logger.error("=" * 60)
             logger.error(f"✗ Failed after {elapsed:.1f}s: {e}")
             
-            # Save diagnostic screenshot
-            screenshot_path = output_path.with_suffix('.error.png')
-            try:
-                await page.screenshot(path=screenshot_path, full_page=True)
-                logger.error(f"  Screenshot: {screenshot_path}")
-            except:
-                pass
-            
-            # Save page HTML for debugging
-            html_path = output_path.with_suffix('.error.html')
-            try:
-                html_content = await page.content()
-                html_path.write_text(html_content)
-                logger.error(f"  HTML dump: {html_path}")
-            except:
-                pass
-            
             logger.error("=" * 60)
             return False
             
@@ -369,9 +352,17 @@ async def generate_europass_pdf(
 
 
 def main():
-    parent_dir = Path(__file__).parent.parent
-    xml_path = parent_dir / "europass-enriched.xml"
-    output_path = parent_dir / "CV-Europass-Progres.pdf"
+    # Project root is parent of src/
+    project_root = Path(__file__).parent.parent
+    input_dir = project_root / "input"
+    output_dir = project_root / "output"
+    
+    # Ensure directories exist
+    input_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(exist_ok=True)
+    
+    xml_path = input_dir / "europass.xml"
+    output_path = output_dir / "CV-Europass.pdf"
     
     if not xml_path.exists():
         logger.error(f"XML file not found: {xml_path}")
