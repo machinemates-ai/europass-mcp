@@ -4,32 +4,43 @@ Europass CV PDF Generator using Playwright Automation
 
 Automates the NEW Europass CV beta builder (/compact-cv-editor) to:
 1. Import an XML file
-2. Select template cv-professional (optimal for ATS/AI/Human review)
+2. Select template (default: cv-formal/Progrès)
 3. Generate and download the PDF
 
 Works without EU Login authentication using the guest editor.
 
-Template choice rationale:
-- cv-professional: Single-column, ATS-safe, clean parsing for AI screening,
-  ALL CAPS job titles for instant recruiter recognition.
+Best Practices Applied:
+- Polling with expect/wait_for instead of hardcoded sleeps
+- Explicit wait conditions for UI state changes
+- Retry logic for flaky network operations
+- Structured logging with timing
+- Graceful error handling with diagnostics
 """
 
 import asyncio
 import sys
+import time
+import logging
 from pathlib import Path
-from datetime import datetime
 
 try:
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
 except ImportError:
     print("Installing playwright...")
     import subprocess
     subprocess.run([sys.executable, "-m", "pip", "install", "playwright"])
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
 
-# Template mapping for the new beta builder combobox
-# Uses value attribute for selection
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# Template mapping for the beta builder
 TEMPLATES = {
     "cv-academic": "cv-academic",
     "cv-creative": "cv-creative",
@@ -40,6 +51,156 @@ TEMPLATES = {
 }
 
 DEFAULT_TEMPLATE = "cv-formal"
+EUROPASS_URL = "https://europa.eu/europass/eportfolio/screen/cv-editor?lang=fr"
+
+
+async def wait_for_network_idle(page: Page, timeout: int = 10000) -> None:
+    """Wait for network to be idle (no pending requests)."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout)
+    except PlaywrightTimeout:
+        logger.warning("Network idle timeout - continuing anyway")
+
+
+async def handle_resume_dialog(page: Page) -> None:
+    """Handle the 'Resume last CV' dialog if present.
+    
+    Uses try/expect pattern instead of hardcoded waits.
+    """
+    try:
+        # Check if resume dialog appears (with short timeout)
+        resume_btn = page.get_by_role("button", name="Commencer à partir du CV Europass")
+        
+        if await resume_btn.is_visible():
+            await resume_btn.click()
+            logger.info("  Dismissed 'Resume last CV' prompt")
+            
+            # Wait for and click Continue
+            continue_btn = page.get_by_role("button", name="Continuer")
+            try:
+                await continue_btn.wait_for(state="visible", timeout=5000)
+                await continue_btn.click()
+                logger.info("  Clicked 'Continuer'")
+            except PlaywrightTimeout:
+                pass  # No continue button needed
+    except:
+        pass  # No resume dialog present
+
+
+async def upload_xml_file(page: Page, xml_path: Path, timeout: int) -> bool:
+    """Upload XML file using file chooser.
+    
+    Uses expect_file_chooser for proper event handling.
+    """
+    try:
+        file_button = page.get_by_role("button", name="Sélectionner un fichier")
+        await file_button.wait_for(state="visible", timeout=timeout)
+        
+        # Use expect pattern for file chooser - proper async handling
+        async with page.expect_file_chooser(timeout=timeout) as fc_info:
+            await file_button.click()
+        
+        file_chooser = await fc_info.value
+        await file_chooser.set_files(str(xml_path))
+        
+        # Wait for file to be processed - poll for builder button
+        builder_button = page.get_by_role("button", name="Try the new CV builder (beta)")
+        await builder_button.wait_for(state="visible", timeout=timeout)
+        
+        logger.info(f"✓ Uploaded: {xml_path.name}")
+        return True
+    except Exception as e:
+        logger.error(f"✗ Failed to upload file: {e}")
+        return False
+
+
+async def wait_for_preview_ready(page: Page, timeout: int = 30000) -> bool:
+    """Wait for PDF preview to be fully rendered.
+    
+    Polls for specific indicators that preview is ready:
+    1. Preview container exists
+    2. No loading spinners
+    3. Download button is enabled
+    """
+    try:
+        # Wait for preview image/canvas to appear
+        preview_selector = "img[alt], canvas, .preview-container"
+        await page.wait_for_selector(preview_selector, state="visible", timeout=timeout)
+        
+        # Wait for any loading indicators to disappear
+        loading_selectors = [".loading", ".spinner", "[class*='loading']", "[class*='spinner']"]
+        for selector in loading_selectors:
+            try:
+                await page.wait_for_selector(selector, state="hidden", timeout=5000)
+            except PlaywrightTimeout:
+                pass  # Selector doesn't exist or already hidden
+        
+        # Wait for download button to be enabled (indicates preview is ready)
+        download_btn = page.get_by_role("button", name="Télécharger")
+        await download_btn.wait_for(state="visible", timeout=timeout)
+        
+        # Poll until button is not disabled
+        await page.wait_for_function(
+            """() => {
+                const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Télécharger'));
+                return btn && !btn.disabled;
+            }""",
+            timeout=timeout
+        )
+        
+        logger.info("✓ Preview rendered")
+        return True
+    except PlaywrightTimeout:
+        logger.warning("⚠ Preview timeout - attempting download anyway")
+        return True  # Try to proceed
+    except Exception as e:
+        logger.error(f"✗ Preview error: {e}")
+        return False
+
+
+async def download_pdf_with_retry(
+    page: Page,
+    output_path: Path,
+    timeout: int,
+    max_retries: int = 3
+) -> bool:
+    """Download PDF with retry logic.
+    
+    Uses expect_download for proper async download handling.
+    Beta builder needs extra time for server-side PDF generation.
+    """
+    download_btn = page.get_by_role("button", name="Télécharger")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            await download_btn.wait_for(state="visible", timeout=timeout)
+            
+            # Beta builder generates PDF server-side, needs longer timeout
+            download_timeout = timeout * 2  # Double timeout for download
+            
+            async with page.expect_download(timeout=download_timeout) as download_info:
+                await download_btn.click()
+            
+            download = await download_info.value
+            
+            # Wait for download to complete (server-side PDF generation can be slow)
+            await download.save_as(output_path)
+            
+            # Verify file was created and has content
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return True
+            else:
+                logger.warning(f"  Attempt {attempt}: Downloaded file empty or missing")
+                
+        except PlaywrightTimeout:
+            logger.warning(f"  Attempt {attempt}: Download timeout")
+        except Exception as e:
+            logger.warning(f"  Attempt {attempt}: {e}")
+        
+        if attempt < max_retries:
+            await asyncio.sleep(2)  # Brief pause before retry
+    
+    return False
 
 
 async def generate_europass_pdf(
@@ -47,143 +208,142 @@ async def generate_europass_pdf(
     output_path: Path,
     template: str = DEFAULT_TEMPLATE,
     headless: bool = True,
-    timeout: int = 90000
+    timeout: int = 60000
 ) -> bool:
     """Generate a Europass PDF from an XML file using browser automation.
     
     Args:
         xml_path: Path to the Europass XML file
         output_path: Path where the PDF will be saved
-        template: Template name (cv-professional, cv-elegant, etc.)
+        template: Template name (cv-formal, cv-elegant, etc.)
         headless: Run browser in headless mode
         timeout: Operation timeout in milliseconds
+    
+    Returns:
+        True if PDF was generated successfully, False otherwise
     """
-    print(f"{'='*60}")
-    print(f"Europass CV PDF Generator (Beta Builder)")
-    print(f"{'='*60}")
-    print(f"Input:    {xml_path}")
-    print(f"Output:   {output_path}")
-    print(f"Template: {template}")
-    print(f"Mode:     {'headless' if headless else 'visible'}")
-    print(f"{'='*60}\n")
+    start_time = time.time()
+    
+    logger.info("=" * 60)
+    logger.info("Europass CV PDF Generator (Beta Builder)")
+    logger.info("=" * 60)
+    logger.info(f"Input:    {xml_path}")
+    logger.info(f"Output:   {output_path}")
+    logger.info(f"Template: {template}")
+    logger.info(f"Mode:     {'headless' if headless else 'visible'}")
+    logger.info("=" * 60)
     
     if template not in TEMPLATES:
-        print(f"✗ Unknown template: {template}")
-        print(f"  Available: {', '.join(TEMPLATES.keys())}")
+        logger.error(f"Unknown template: {template}")
+        logger.error(f"Available: {', '.join(TEMPLATES.keys())}")
         return False
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
             accept_downloads=True,
-            locale='fr-FR'
+            locale='fr-FR',
+            viewport={'width': 1280, 'height': 900}
         )
         page = await context.new_page()
         
+        # Set default timeout for all operations
+        page.set_default_timeout(timeout)
+        
         try:
             # Step 1: Navigate to CV editor
-            print("1/8 Navigating to Europass CV editor...")
-            await page.goto(
-                "https://europa.eu/europass/eportfolio/screen/cv-editor?lang=fr",
-                wait_until="networkidle",
-                timeout=timeout
-            )
-            await page.wait_for_timeout(2000)
+            logger.info("1/7 Navigating to Europass...")
+            await page.goto(EUROPASS_URL, wait_until="domcontentloaded")
+            await wait_for_network_idle(page)
             
-            # Step 2: Handle "Resume last CV" dialog if present
-            print("2/8 Handling dialogs...")
-            try:
-                resume_dialog = page.get_by_role("button", name="Commencer à partir du CV Europass")
-                if await resume_dialog.is_visible(timeout=3000):
-                    await resume_dialog.click()
-                    await page.wait_for_timeout(1000)
-                    # Click "Continuer" to dismiss
-                    continue_btn = page.get_by_role("button", name="Continuer")
-                    if await continue_btn.is_visible(timeout=2000):
-                        await continue_btn.click()
-                        await page.wait_for_timeout(1000)
-            except:
-                pass  # No resume dialog
+            # Step 2: Handle any resume dialogs
+            logger.info("2/7 Handling dialogs...")
+            await handle_resume_dialog(page)
             
             # Step 3: Upload XML file
-            print("3/8 Uploading XML file...")
-            file_button = page.get_by_role("button", name="Sélectionner un fichier")
-            await file_button.wait_for(state="visible", timeout=timeout)
-            
-            async with page.expect_file_chooser() as fc_info:
-                await file_button.click()
-            file_chooser = await fc_info.value
-            await file_chooser.set_files(str(xml_path))
-            await page.wait_for_timeout(3000)
+            logger.info("3/7 Uploading XML...")
+            if not await upload_xml_file(page, xml_path, timeout):
+                raise Exception("Failed to upload XML file")
             
             # Step 4: Select new CV builder (beta)
-            print("4/8 Selecting new CV builder (beta)...")
-            builder_button = page.get_by_role("button", name="Try the new CV builder (beta)")
-            await builder_button.wait_for(state="visible", timeout=timeout)
-            await builder_button.click()
+            logger.info("4/7 Selecting beta builder...")
+            builder_btn = page.get_by_role("button", name="Try the new CV builder (beta)")
+            await builder_btn.click()
             
-            # Wait for compact-cv-editor to load
+            # Wait for URL change (poll instead of hardcoded wait)
             await page.wait_for_url("**/compact-cv-editor**", timeout=timeout)
-            await page.wait_for_timeout(3000)
+            await wait_for_network_idle(page)
             
-            # Step 5: Select template from dropdown
-            print(f"5/8 Selecting template: {template}...")
+            # Step 5: Select template
+            logger.info(f"5/7 Selecting template: {template}...")
             template_select = page.locator("select.ecl-select").first
             await template_select.wait_for(state="visible", timeout=timeout)
             await template_select.select_option(value=TEMPLATES[template])
-            await page.wait_for_timeout(2000)
             
-            # Step 6: Enter CV name
-            print("6/8 Entering CV name...")
+            # Step 6: Enter CV name and wait for preview
+            logger.info("6/7 Configuring and rendering...")
             name_input = page.get_by_role("textbox", name="Nom")
             await name_input.wait_for(state="visible", timeout=timeout)
             await name_input.fill(output_path.stem)
-            await page.wait_for_timeout(1000)
             
-            # Step 7: Wait for preview to render
-            print("7/8 Waiting for PDF preview to render...")
-            await page.wait_for_timeout(5000)
+            # Wait for preview to be ready (polling)
+            await wait_for_preview_ready(page, timeout)
             
-            # Step 8: Download PDF
-            print("8/8 Downloading PDF...")
-            download_button = page.get_by_role("button", name="Télécharger")
-            await download_button.wait_for(state="visible", timeout=timeout)
+            # Step 7: Download PDF
+            logger.info("7/7 Downloading PDF...")
+            if not await download_pdf_with_retry(page, output_path, timeout):
+                raise Exception("Failed to download PDF after retries")
             
-            async with page.expect_download(timeout=timeout) as download_info:
-                await download_button.click()
-            
-            download = await download_info.value
-            await download.save_as(output_path)
-            
+            # Success
+            elapsed = time.time() - start_time
             file_size = output_path.stat().st_size
-            print(f"\n{'='*60}")
-            print(f"✓ PDF saved successfully!")
-            print(f"  Path: {output_path}")
-            print(f"  Size: {file_size:,} bytes ({file_size/1024:.1f} KB)")
-            print(f"{'='*60}")
+            
+            logger.info("=" * 60)
+            logger.info("✓ PDF generated successfully!")
+            logger.info(f"  Path: {output_path}")
+            logger.info(f"  Size: {file_size:,} bytes ({file_size/1024:.1f} KB)")
+            logger.info(f"  Time: {elapsed:.1f}s")
+            logger.info("=" * 60)
             
             return True
             
         except Exception as e:
-            print(f"\n{'='*60}")
-            print(f"✗ Error: {e}")
+            elapsed = time.time() - start_time
+            logger.error("=" * 60)
+            logger.error(f"✗ Failed after {elapsed:.1f}s: {e}")
+            
+            # Save diagnostic screenshot
             screenshot_path = output_path.with_suffix('.error.png')
-            await page.screenshot(path=screenshot_path, full_page=True)
-            print(f"  Screenshot saved: {screenshot_path}")
-            print(f"{'='*60}")
+            try:
+                await page.screenshot(path=screenshot_path, full_page=True)
+                logger.error(f"  Screenshot: {screenshot_path}")
+            except:
+                pass
+            
+            # Save page HTML for debugging
+            html_path = output_path.with_suffix('.error.html')
+            try:
+                html_content = await page.content()
+                html_path.write_text(html_content)
+                logger.error(f"  HTML dump: {html_path}")
+            except:
+                pass
+            
+            logger.error("=" * 60)
             return False
             
         finally:
+            await context.close()
             await browser.close()
 
 
 def main():
     parent_dir = Path(__file__).parent.parent
     xml_path = parent_dir / "europass-enriched.xml"
-    output_path = parent_dir / "CV-Europass-Professional.pdf"
+    output_path = parent_dir / "CV-Europass-Progres.pdf"
     
     if not xml_path.exists():
-        print(f"Error: XML file not found: {xml_path}")
+        logger.error(f"XML file not found: {xml_path}")
         sys.exit(1)
     
     # Parse arguments
@@ -193,12 +353,15 @@ def main():
     for arg in sys.argv[1:]:
         if arg.startswith("--template="):
             template = arg.split("=", 1)[1]
+        elif arg.startswith("--output="):
+            output_path = Path(arg.split("=", 1)[1])
     
     if "--help" in sys.argv or "-h" in sys.argv:
         print("Usage: python europass_playwright.py [OPTIONS]")
         print("\nOptions:")
         print("  --visible              Run browser in visible mode (default: headless)")
-        print("  --template=NAME        Select template (default: cv-professional)")
+        print("  --template=NAME        Select template (default: cv-formal)")
+        print("  --output=PATH          Output PDF path")
         print("\nAvailable templates:")
         for name in TEMPLATES:
             marker = " ★ (recommended)" if name == DEFAULT_TEMPLATE else ""
