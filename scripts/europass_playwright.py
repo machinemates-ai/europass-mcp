@@ -122,42 +122,6 @@ async def upload_xml_file(page: Page, xml_path: Path, timeout: int) -> bool:
         return False
 
 
-async def wait_for_preview_ready(page: Page, timeout: int = 30000) -> bool:
-    """Wait for PDF preview to be fully rendered.
-    
-    Polls for specific indicators that preview is ready:
-    1. Preview container exists
-    2. No loading spinners
-    3. Download button is enabled
-    """
-    try:
-        # Wait for preview image/canvas to appear
-        preview_selector = "img[alt], canvas, .preview-container"
-        await page.wait_for_selector(preview_selector, state="visible", timeout=timeout)
-        
-        # Wait for any loading indicators to disappear
-        loading_selectors = [".loading", ".spinner", "[class*='loading']", "[class*='spinner']"]
-        for selector in loading_selectors:
-            try:
-                await page.wait_for_selector(selector, state="hidden", timeout=5000)
-            except PlaywrightTimeout:
-                pass  # Selector doesn't exist or already hidden
-        
-        # Wait for download button to be visible (indicates preview is ready)
-        # Use aria-label selector - more stable than text content
-        download_btn = page.locator("button[aria-label='Télécharger']")
-        await download_btn.wait_for(state="visible", timeout=timeout)
-        
-        logger.info("✓ Preview rendered")
-        return True
-    except PlaywrightTimeout:
-        logger.warning("⚠ Preview timeout - attempting download anyway")
-        return True  # Try to proceed
-    except Exception as e:
-        logger.error(f"✗ Preview error: {e}")
-        return False
-
-
 async def wait_for_angular_stable(page: Page, timeout: int = 5000) -> bool:
     """Wait for Angular hydration to complete (event handlers attached).
     
@@ -235,7 +199,8 @@ async def download_pdf_with_retry(
         except Exception as e:
             logger.warning(f"  Attempt {attempt}: {e}")
             if attempt < max_retries:
-                await asyncio.sleep(0.5)
+                interval = retry_intervals[min(attempt - 1, len(retry_intervals) - 1)]
+                await asyncio.sleep(interval / 1000)
     
     return False
 
@@ -313,7 +278,7 @@ async def generate_europass_pdf(
                 await continue_btn.wait_for(state="visible", timeout=3000)
                 await continue_btn.click()
                 logger.info("  Clicked 'Continuer' to confirm")
-                await asyncio.sleep(1)
+                await wait_for_network_idle(page, timeout=5000)
             except PlaywrightTimeout:
                 pass
             
