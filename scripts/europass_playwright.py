@@ -303,16 +303,16 @@ async def generate_europass_pdf(
             
             # Step 5: Select template by value (not index - order may change)
             logger.info(f"5/7 Selecting template: {template}...")
-            await asyncio.sleep(1)  # Let the page stabilize
             
-            # Select by value - stable regardless of option order
+            # Wait for template select to be visible and interactive
             template_select = page.locator("select.ecl-select").first
             await template_select.wait_for(state="visible", timeout=10000)
             await template_select.select_option(value=TEMPLATES[template])
             logger.info(f"  ✓ Selected template: {template}")
             
-            # Wait for template to apply and preview to regenerate
-            await asyncio.sleep(3)
+            # Wait for template change to take effect
+            # Simply wait for network to settle after template selection
+            await wait_for_network_idle(page, timeout=10000)
             
             # Step 6: Enter CV name (REQUIRED before download)
             logger.info("6/7 Entering CV name...")
@@ -323,15 +323,19 @@ async def generate_europass_pdf(
             await name_input.press("Tab")  # Trigger blur/validation
             logger.info(f"  ✓ CV name set to: {output_path.stem}")
             
-            # Wait for form validation and preview to update after name change
-            await asyncio.sleep(2)
+            # Brief pause for form validation after Tab key
+            await asyncio.sleep(0.5)
             
-            # Wait for preview to be fully ready (polling)
+            # Poll: wait for download button to be enabled
             logger.info("  Waiting for preview to render...")
-            await wait_for_preview_ready(page, timeout)
-            
-            # Extra wait for PDF to be ready server-side
-            await asyncio.sleep(2)
+            await page.wait_for_function(
+                """() => {
+                    const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Télécharger'));
+                    return btn && !btn.disabled && btn.offsetParent !== null;
+                }""",
+                timeout=30000
+            )
+            logger.info("  ✓ Preview ready, download button enabled")
             
             # Step 7: Download PDF
             logger.info("7/7 Downloading PDF...")
