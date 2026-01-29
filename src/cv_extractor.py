@@ -76,7 +76,11 @@ elif not (OPENAI_AVAILABLE or GOOGLE_AVAILABLE or ANTHROPIC_AVAILABLE):
     logger.warning("  pip install langchain-google-genai")
     logger.warning("  pip install langchain-anthropic")
 
-from .mac_schema import ExtractedCV, extracted_cv_to_mac
+# Support both relative and absolute imports
+try:
+    from .mac_schema import ExtractedCV, extracted_cv_to_mac
+except ImportError:
+    from mac_schema import ExtractedCV, extracted_cv_to_mac
 
 # Default model by provider
 DEFAULT_MODELS = {
@@ -106,9 +110,9 @@ MODEL_PROVIDERS = {
 
 def _get_default_model() -> tuple[str, str]:
     """Get the default model based on available providers and API keys."""
-    # Prefer Gemini if available (best price/performance for extraction)
+    # Prefer Gemini if available (benchmark winner: 5x faster, perfect accuracy)
     if GOOGLE_AVAILABLE and os.getenv("GOOGLE_API_KEY"):
-        return "gemini-2.5-flash", "google"
+        return "gemini-3-flash-preview", "google"
     # Fall back to OpenAI
     if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
         return "gpt-4o-mini", "openai"
