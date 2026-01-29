@@ -81,7 +81,7 @@ from .mac_schema import ExtractedCV, extracted_cv_to_mac
 # Default model by provider
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
-    "google": "gemini-2.5-flash", 
+    "google": "gemini-3-flash-preview",  # Winner of benchmark: 6x faster, perfect accuracy
     "anthropic": "claude-3-5-haiku-latest",
 }
 
@@ -93,7 +93,7 @@ MODEL_PROVIDERS = {
     "gpt-5-mini": "openai",
     "gpt-5-nano": "openai",
     # Google
-    "gemini-3-flash": "google",
+    "gemini-3-flash-preview": "google",
     "gemini-2.5-flash": "google",
     "gemini-2.5-flash-lite": "google",
     "gemini-2.5-pro": "google",
