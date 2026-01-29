@@ -1,0 +1,4 @@
+[console_scripts]
+europass-enrich = src.generate_enriched_europass:main
+europass-mcp = src.mcp_server:main
+europass-pdf = src.europass_playwright:main

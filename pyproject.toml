@@ -14,8 +14,8 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = [
-    "trustcall>=0.1",
-    "langchain-openai>=0.3",
+    "trustcall>=0.0.35",
+    "langchain-openai>=1.0",
 ]
 dev = [
     "pytest",
