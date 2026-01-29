@@ -1,0 +1,192 @@
+{
+  "$schema": "./mac_schema.json",
+  "settings": {
+    "language": "FR",
+    "lastUpdate": "2025-01-28",
+    "MACVersion": "0.3"
+  },
+  "aboutMe": {
+    "profile": {
+      "name": "Guillaume",
+      "surnames": "FORTAINE",
+      "title": "Senior Full Stack Developer & AI Specialist",
+      "description": "Passionate about building AI-powered applications with expertise in LangChain, RAG, and modern web technologies.",
+      "birthday": "1984-02-18",
+      "location": {
+        "country": "FR",
+        "municipality": "Paris",
+        "postalCode": "75010",
+        "address": "Paris Nord"
+      }
+    },
+    "relevantYearsOfExperience": 10,
+    "relevantLinks": [
+      {
+        "type": "linkedin",
+        "URL": "https://www.linkedin.com/in/gfortaine/",
+        "description": "LinkedIn Profile"
+      },
+      {
+        "type": "github",
+        "URL": "https://github.com/gfortaine",
+        "description": "GitHub Profile"
+      }
+    ]
+  },
+  "careerPreferences": {
+    "contact": {
+      "contactMails": ["guillaume+linkedin@fortaine.com"],
+      "phoneNumbers": [
+        {
+          "countryCode": "+33",
+          "number": "631092519"
+        }
+      ]
+    }
+  },
+  "experience": {
+    "jobs": [
+      {
+        "organization": {
+          "name": "RAJA Group",
+          "description": "European B2B packaging leader (€1.7B revenue, 19 countries)",
+          "URL": "https://www.raja.fr/",
+          "location": {
+            "country": "FR",
+            "municipality": "Paris"
+          }
+        },
+        "roles": [
+          {
+            "name": "Senior Full Stack Developer AI (ReactJS / Python) - Generative AI / LLM Specialist",
+            "startDate": "2024-01",
+            "finishDate": "2025-09",
+            "challenges": [
+              {
+                "description": "AI e-commerce Agent (Boxy): Designed multimodal assistant (text/voice/image) increasing customer conversion.",
+                "actions": [
+                  "Live demo: https://www.raja.fr/votre-assistant-emballage"
+                ]
+              },
+              {
+                "description": "RAG Pipelines: Architected RAG systems (LangChain, Azure OpenAI, pgvector) for chatbots using 10K+ documents."
+              },
+              {
+                "description": "Multi-agent Orchestration: Deployed LangGraph workflows reducing processing time by 60%."
+              },
+              {
+                "description": "LLM Observability: Implemented LangSmith for debugging, tracing and GenAI evaluation."
+              }
+            ],
+            "competences": [
+              { "name": "Python", "type": "technology" },
+              { "name": "LangChain", "type": "technology" },
+              { "name": "LangGraph", "type": "technology" },
+              { "name": "FastAPI", "type": "technology" },
+              { "name": "Azure OpenAI", "type": "tool" },
+              { "name": "Next.js", "type": "technology" },
+              { "name": "Docker", "type": "tool" }
+            ]
+          }
+        ]
+      },
+      {
+        "organization": {
+          "name": "Ministère de l'Intérieur et des Outre-mer",
+          "description": "French Government Ministry",
+          "location": {
+            "country": "FR",
+            "municipality": "Paris"
+          }
+        },
+        "roles": [
+          {
+            "name": "Lead Dev Front",
+            "startDate": "2023-01",
+            "finishDate": "2023-12",
+            "challenges": [
+              {
+                "description": "Government portal 'Plainte En Ligne' - UX redesign for 67M French citizens."
+              },
+              {
+                "description": "Developed responsive portal compliant with RGAA ≥75% accessibility."
+              }
+            ],
+            "competences": [
+              { "name": "Symfony", "type": "technology" },
+              { "name": "TypeScript", "type": "technology" },
+              { "name": "Tailwind CSS", "type": "technology" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "knowledge": {
+    "languages": [
+      {
+        "name": "FR",
+        "fullName": "French",
+        "level": "Native or bilingual proficiency"
+      },
+      {
+        "name": "EN",
+        "fullName": "English",
+        "level": "Full professional proficiency"
+      }
+    ],
+    "hardSkills": [
+      { "skill": { "name": "Python", "type": "technology" }, "level": "expert" },
+      { "skill": { "name": "TypeScript", "type": "technology" }, "level": "expert" },
+      { "skill": { "name": "React", "type": "technology" }, "level": "expert" },
+      { "skill": { "name": "LangChain", "type": "technology" }, "level": "expert" },
+      { "skill": { "name": "Next.js", "type": "technology" }, "level": "high" }
+    ],
+    "studies": [
+      {
+        "studyType": "certification",
+        "degreeAchieved": true,
+        "name": "Certified SAFe® 6 Scrum Product Owner / Product Manager",
+        "startDate": "2024-06",
+        "finishDate": "2024-06",
+        "institution": {
+          "name": "Scaled Agile, Inc.",
+          "URL": "https://scaledagile.com/",
+          "location": {
+            "country": "US",
+            "municipality": "Boulder"
+          }
+        }
+      },
+      {
+        "studyType": "certification",
+        "degreeAchieved": true,
+        "name": "FullStack Developer, Web Development",
+        "description": "Change your life: Learn to code",
+        "startDate": "2016-02",
+        "finishDate": "2016-03",
+        "institution": {
+          "name": "Le Wagon",
+          "URL": "https://www.lewagon.com/",
+          "location": {
+            "country": "FR"
+          }
+        }
+      },
+      {
+        "studyType": "officialDegree",
+        "degreeAchieved": true,
+        "name": "Licence Mathématiques",
+        "startDate": "2003-09",
+        "finishDate": "2010-09",
+        "institution": {
+          "name": "Université des Sciences et Technologies de Lille (Lille I)",
+          "location": {
+            "country": "FR",
+            "municipality": "LILLE"
+          }
+        }
+      }
+    ]
+  }
+}

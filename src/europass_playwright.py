@@ -211,7 +211,8 @@ async def generate_europass_pdf(
     output_path: Path,
     template: str = DEFAULT_TEMPLATE,
     headless: bool = True,
-    timeout: int = 60000
+    timeout: int = 60000,
+    har_path: Path | None = None
 ) -> bool:
     """Generate a Europass PDF from an XML file using browser automation.
     
@@ -221,6 +222,7 @@ async def generate_europass_pdf(
         template: Template name (cv-formal, cv-elegant, etc.)
         headless: Run browser in headless mode
         timeout: Operation timeout in milliseconds
+        har_path: Optional path to save HAR file for API analysis
     
     Returns:
         True if PDF was generated successfully, False otherwise
@@ -234,6 +236,8 @@ async def generate_europass_pdf(
     logger.info(f"Output:   {output_path}")
     logger.info(f"Template: {template}")
     logger.info(f"Mode:     {'headless' if headless else 'visible'}")
+    if har_path:
+        logger.info(f"HAR:      {har_path}")
     logger.info("=" * 60)
     
     if template not in TEMPLATES:
@@ -243,11 +247,14 @@ async def generate_europass_pdf(
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            accept_downloads=True,
-            locale='fr-FR',
-            viewport={'width': 1920, 'height': 1080}  # Full HD to avoid responsive mobile layout
-        )
+        context_opts = {
+            'accept_downloads': True,
+            'locale': 'fr-FR',
+            'viewport': {'width': 1920, 'height': 1080}  # Full HD to avoid responsive mobile layout
+        }
+        if har_path:
+            context_opts['record_har_path'] = str(har_path)
+        context = await browser.new_context(**context_opts)
         page = await context.new_page()
         
         # Set default timeout for all operations
@@ -382,20 +389,31 @@ def main():
         print("Usage: python europass_playwright.py [OPTIONS]")
         print("\nOptions:")
         print("  --visible              Run browser in visible mode (default: headless)")
+        print("  --headless             Run browser in headless mode")
         print("  --template=NAME        Select template (default: cv-formal)")
         print("  --output=PATH          Output PDF path")
+        print("  --capture-har          Record HAR file for API analysis")
         print("\nAvailable templates:")
         for name in TEMPLATES:
             marker = " ★ (recommended)" if name == DEFAULT_TEMPLATE else ""
             print(f"  - {name}{marker}")
         sys.exit(0)
     
+    # Check for HAR capture mode
+    har_path = None
+    if "--capture-har" in sys.argv:
+        har_path = output_dir / "europass.har"
+    
     success = asyncio.run(generate_europass_pdf(
         xml_path=xml_path,
         output_path=output_path,
         template=template,
-        headless=headless
+        headless=headless,
+        har_path=har_path
     ))
+    
+    if har_path and har_path.exists():
+        logger.info(f"📦 HAR saved: {har_path} ({har_path.stat().st_size/1024:.1f} KB)")
     
     sys.exit(0 if success else 1)
 

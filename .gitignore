@@ -6,3 +6,6 @@ __pycache__/
 
 # Generated output files
 output/
+
+# Input documents (personal CVs)
+input/*

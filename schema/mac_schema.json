@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "$id": "http://github.com/manfred/mac/schema.json",
+  "title": "Manfred Awesomic CV",
+  "description": "An open CV format - Subset for Europass conversion",
+  "type": "object",
+  "required": ["settings", "aboutMe"],
+  "properties": {
+    "settings": {
+      "type": "object",
+      "required": ["language"],
+      "properties": {
+        "language": {
+          "type": "string",
+          "description": "ISO 639-1 language code",
+          "examples": ["EN", "FR", "DE"]
+        },
+        "lastUpdate": {
+          "type": "string",
+          "format": "date"
+        },
+        "MACVersion": {
+          "type": "string",
+          "default": "0.3"
+        }
+      }
+    },
+    "aboutMe": {
+      "type": "object",
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/person"
+        },
+        "relevantYearsOfExperience": {
+          "type": "number"
+        },
+        "relevantLinks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "URL"],
+            "properties": {
+              "type": {
+                "enum": ["linkedin", "github", "twitter", "website", "other"]
+              },
+              "URL": {
+                "type": "string",
+                "format": "uri"
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "experience": {
+      "type": "object",
+      "properties": {
+        "jobs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["organization", "roles"],
+            "properties": {
+              "organization": {
+                "$ref": "#/$defs/organization"
+              },
+              "roles": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/role"
+                }
+              }
+            }
+          }
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "details": {
+                "$ref": "#/$defs/organization"
+              },
+              "type": {
+                "enum": ["sideProject", "openSource", "personalProject"]
+              },
+              "roles": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/role"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "knowledge": {
+      "type": "object",
+      "properties": {
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "ISO 639-1 code (EN, FR, DE)"
+              },
+              "fullName": {
+                "type": "string"
+              },
+              "level": {
+                "enum": [
+                  "Elementary proficiency",
+                  "Limited working proficiency",
+                  "Professional working proficiency",
+                  "Full professional proficiency",
+                  "Native or bilingual proficiency"
+                ]
+              }
+            }
+          }
+        },
+        "hardSkills": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "skill": {
+                "$ref": "#/$defs/competence"
+              },
+              "level": {
+                "enum": ["basic", "intermediate", "high", "expert"]
+              }
+            }
+          }
+        },
+        "softSkills": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "skill": {
+                "$ref": "#/$defs/competence"
+              }
+            }
+          }
+        },
+        "studies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["studyType", "degreeAchieved", "name", "startDate"],
+            "properties": {
+              "studyType": {
+                "enum": [
+                  "officialDegree",
+                  "certification",
+                  "unlessDegree",
+                  "selfTraining"
+                ]
+              },
+              "degreeAchieved": {
+                "type": "boolean"
+              },
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "startDate": {
+                "type": "string",
+                "format": "date"
+              },
+              "finishDate": {
+                "type": "string",
+                "format": "date"
+              },
+              "institution": {
+                "$ref": "#/$defs/organization"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "person": {
+      "type": "object",
+      "required": ["name", "surnames"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "surnames": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "birthday": {
+          "type": "string",
+          "format": "date"
+        },
+        "avatar": {
+          "type": "object",
+          "properties": {
+            "alt": { "type": "string" },
+            "link": { "type": "string", "format": "uri" }
+          }
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "contact": {
+          "$ref": "#/$defs/contact"
+        }
+      }
+    },
+    "location": {
+      "type": "object",
+      "properties": {
+        "country": {
+          "type": "string",
+          "description": "ISO 3166-1 alpha-2"
+        },
+        "region": {
+          "type": "string"
+        },
+        "municipality": {
+          "type": "string"
+        },
+        "postalCode": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        }
+      }
+    },
+    "contact": {
+      "type": "object",
+      "properties": {
+        "contactMails": {
+          "type": "array",
+          "items": { "type": "string", "format": "email" }
+        },
+        "phoneNumbers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "publicProfiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": { "enum": ["linkedin", "github", "twitter", "website", "other"] },
+              "URL": { "type": "string", "format": "uri" }
+            }
+          }
+        }
+      }
+    },
+    "organization": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "URL": {
+          "type": "string",
+          "format": "uri"
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        }
+      }
+    },
+    "role": {
+      "type": "object",
+      "required": ["name", "startDate"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "startDate": {
+          "type": "string",
+          "format": "date"
+        },
+        "finishDate": {
+          "type": "string",
+          "format": "date"
+        },
+        "challenges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "description": { "type": "string" },
+              "actions": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "competences": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/competence"
+          }
+        }
+      }
+    },
+    "competence": {
+      "type": "object",
+      "required": ["name", "type"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "enum": ["tool", "technology", "practice", "hardware", "domain"]
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

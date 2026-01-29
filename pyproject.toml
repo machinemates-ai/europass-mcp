@@ -1,10 +1,12 @@
 [project]
 name = "europass-generator"
 version = "1.0.0"
-description = "Europass CV PDF Generator using Playwright automation"
+description = "Europass CV PDF Generator MCP Server"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastmcp>=2.14",
+    "markitdown[docx,pdf]>=0.1",
     "playwright>=1.50",
 ]
 
@@ -20,6 +22,7 @@ dev = [
 [project.scripts]
 europass-pdf = "src.europass_playwright:main"
 europass-enrich = "src.generate_enriched_europass:main"
+europass-mcp = "src.mcp_server:main"
 
 [tool.ruff]
 line-length = 100
