@@ -14,6 +14,10 @@ from src.mcp_server import (
     _validate_date,
     _mac_to_europass_xml,
     _resumes,
+    _country_to_code,
+    _phone_country_to_iso,
+    _language_to_iso639b,
+    _level_to_cef,
 )
 
 
@@ -310,17 +314,17 @@ class TestMacToEuropassXml:
             "aboutMe": {
                 "profile": {
                     "name": "John & Jane",
-                    "surnames": "Smith",
-                    "title": "Developer <Expert>"
+                    "surnames": "O'Brien <Junior>",
                 }
             }
         }
         
         xml = _mac_to_europass_xml(mac)
         
-        # Check XML escaping (& and < > are escaped)
+        # Check XML escaping (& and < > are escaped, apostrophe is optional)
+        # Note: PersonTitle/PersonDescription are NOT generated (not supported by Europass)
         assert "John &amp; Jane" in xml
-        assert "&lt;Expert&gt;" in xml
+        assert "O'Brien &lt;Junior&gt;" in xml  # apostrophe is valid in XML
 
     def test_xml_with_employment(self, sample_mac_json):
         """Test XML generation with employment history."""
@@ -355,6 +359,97 @@ class TestMacToEuropassXml:
         assert "PersonQualifications" in xml
         assert "Python" in xml
         assert "Leadership" in xml
+
+    def test_xml_with_full_description(self):
+        """Test that fullDescription is used over challenges."""
+        mac = {
+            "settings": {"language": "EN"},
+            "aboutMe": {
+                "profile": {"name": "Jane", "surnames": "Smith"}
+            },
+            "experience": {
+                "jobs": [{
+                    "organization": {"name": "Acme Inc"},
+                    "roles": [{
+                        "name": "Engineer",
+                        "startDate": "2022-01",
+                        "challenges": [{"description": "Short bullet"}],
+                        "fullDescription": "<p><strong>Contexte :</strong> Rich HTML content with full details.</p>"
+                    }]
+                }]
+            }
+        }
+        
+        xml = _mac_to_europass_xml(mac)
+        
+        # fullDescription should be used instead of challenges
+        assert "Contexte :" in xml
+        assert "Rich HTML content" in xml
+        # challenges short text should NOT appear since fullDescription takes precedence
+        assert "Short bullet" not in xml
+
+    def test_xml_with_full_description_fallback_to_challenges(self):
+        """Test that challenges are used when fullDescription is missing."""
+        mac = {
+            "settings": {"language": "EN"},
+            "aboutMe": {
+                "profile": {"name": "Jane", "surnames": "Smith"}
+            },
+            "experience": {
+                "jobs": [{
+                    "organization": {"name": "Acme Inc"},
+                    "roles": [{
+                        "name": "Engineer",
+                        "startDate": "2022-01",
+                        "challenges": [{"description": "Fallback bullet point"}]
+                        # No fullDescription field
+                    }]
+                }]
+            }
+        }
+        
+        xml = _mac_to_europass_xml(mac)
+        
+        # challenges should be used as fallback
+        assert "Fallback bullet point" in xml
+
+    def test_xml_with_profile_picture(self):
+        """Test that profilePicture generates Attachment XML."""
+        # Use a small base64 string for testing (1x1 red pixel PNG)
+        test_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+        
+        mac = {
+            "settings": {"language": "EN"},
+            "aboutMe": {
+                "profile": {"name": "Jane", "surnames": "Smith"}
+            },
+            "profilePicture": test_base64
+        }
+        
+        xml = _mac_to_europass_xml(mac)
+        
+        # Check Attachment structure
+        assert "<eures:Attachment>" in xml
+        assert f"<oa:EmbeddedData>{test_base64}</oa:EmbeddedData>" in xml
+        assert "<oa:FileType>photo</oa:FileType>" in xml
+        assert "<hr:Instructions>ProfilePicture</hr:Instructions>" in xml
+        assert "</eures:Attachment>" in xml
+
+    def test_xml_without_profile_picture(self):
+        """Test that no Attachment is generated when profilePicture is missing."""
+        mac = {
+            "settings": {"language": "EN"},
+            "aboutMe": {
+                "profile": {"name": "Jane", "surnames": "Smith"}
+            }
+            # No profilePicture field
+        }
+        
+        xml = _mac_to_europass_xml(mac)
+        
+        # Should NOT have Attachment section
+        assert "<eures:Attachment>" not in xml
+        assert "<oa:EmbeddedData>" not in xml
 
 
 # ============================================================================
@@ -430,3 +525,89 @@ class TestIntegration:
         
         # Should be at max capacity
         assert len(_resumes) == _MAX_RESUMES
+
+
+# ============================================================================
+# Country Code Conversion Tests
+# ============================================================================
+
+class TestCountryToCode:
+    """Tests for _country_to_code function."""
+    
+    def test_country_name_to_code(self):
+        """Test country name to code conversion."""
+        assert _country_to_code("France") == "fr"
+        assert _country_to_code("france") == "fr"
+        assert _country_to_code("FRANCE") == "fr"
+        assert _country_to_code("United States") == "us"
+        assert _country_to_code("Germany") == "de"
+    
+    def test_country_code_passthrough(self):
+        """Test 2-letter codes are returned lowercase."""
+        assert _country_to_code("FR") == "fr"
+        assert _country_to_code("fr") == "fr"
+        assert _country_to_code("US") == "us"
+    
+    def test_empty_country(self):
+        """Test empty input returns empty string."""
+        assert _country_to_code("") == ""
+        assert _country_to_code("  ") == ""
+
+
+class TestPhoneCountryToIso:
+    """Tests for _phone_country_to_iso function."""
+    
+    def test_common_country_codes(self):
+        """Test phone dialing codes to ISO codes."""
+        assert _phone_country_to_iso("33") == "fr"
+        assert _phone_country_to_iso("1") == "us"
+        assert _phone_country_to_iso("44") == "gb"
+        assert _phone_country_to_iso("49") == "de"
+    
+    def test_unknown_code(self):
+        """Test unknown codes return empty string."""
+        assert _phone_country_to_iso("999") == ""
+        assert _phone_country_to_iso("") == ""
+
+
+class TestLanguageToIso639b:
+    """Tests for _language_to_iso639b function."""
+    
+    def test_english_variations(self):
+        """Test English language name variations."""
+        assert _language_to_iso639b("English") == "eng"
+        assert _language_to_iso639b("english") == "eng"
+        assert _language_to_iso639b("eng") == "eng"
+        assert _language_to_iso639b("en") == "eng"
+    
+    def test_french_variations(self):
+        """Test French language name variations."""
+        assert _language_to_iso639b("French") == "fre"
+        assert _language_to_iso639b("français") == "fre"
+        assert _language_to_iso639b("fra") == "fre"
+        assert _language_to_iso639b("fr") == "fre"
+    
+    def test_german_variations(self):
+        """Test German uses ISO 639-2/B code 'ger' not 'deu'."""
+        assert _language_to_iso639b("German") == "ger"
+        assert _language_to_iso639b("deutsch") == "ger"
+    
+    def test_unknown_language(self):
+        """Test unknown language returns first 3 chars."""
+        assert _language_to_iso639b("Klingon") == "kli"
+        assert _language_to_iso639b("") == ""
+
+
+class TestLevelToCef:
+    """Tests for _level_to_cef function."""
+    
+    def test_cef_levels(self):
+        """Test CEF level mapping."""
+        assert _level_to_cef("native") == "C2"
+        assert _level_to_cef("Full professional proficiency") == "C2"
+        assert _level_to_cef("professional working") == "C1"  # Contains "professional"
+        assert _level_to_cef("limited working") == "B2"
+        assert _level_to_cef("intermediate") == "B2"
+        assert _level_to_cef("elementary") == "A2"
+        assert _level_to_cef("basic") == "A2"
+        assert _level_to_cef("unknown") == "B1"  # Default fallback

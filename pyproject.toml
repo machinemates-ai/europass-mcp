@@ -7,12 +7,15 @@ requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2.14",
     "markitdown[docx,pdf]>=0.1",
+    "phonenumbers>=8.13",
     "playwright>=1.50",
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]
-enrich = [
-    "pypdf>=5.0",
+llm = [
+    "trustcall>=0.1",
+    "langchain-openai>=0.3",
 ]
 dev = [
     "pytest",

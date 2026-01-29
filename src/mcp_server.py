@@ -2,6 +2,11 @@
 Europass CV Generator MCP Server
 
 Uses MAC (Manfred Awesomic CV) JSON as internal format, then converts to Europass XML for PDF generation.
+
+Supported input formats:
+- PDF: Extracts embedded XML from Europass PDFs (europa.eu format)
+- DOCX: Parses document content and creates MAC JSON structure
+- XML: Directly imports Europass XML files
 """
 
 import asyncio
@@ -13,6 +18,8 @@ from typing import Any
 from uuid import uuid4
 from xml.sax.saxutils import escape
 
+import phonenumbers
+import pypdf
 from fastmcp import FastMCP
 from markitdown import MarkItDown
 from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout, expect
@@ -43,10 +50,18 @@ mcp = FastMCP(
     instructions="""
     Europass CV Generator - Creates professional CVs in PDF format.
     
-    Workflow:
-    1. Use parse_document to extract text from DOCX/PDF files
-    2. Use create_resume with MAC JSON structure to store CV data
-    3. Use generate_pdf to create the final Europass PDF
+    Workflows:
+    
+    Option A - Import existing CV (recommended):
+    1. Use import_cv to load a PDF, DOCX, or XML file
+       - PDF: Extracts embedded XML from Europass PDFs (europa.eu format)
+       - DOCX: Returns text content for processing
+       - XML: Directly imports Europass XML
+    2. Use generate_pdf to create the final PDF
+    
+    Option B - Create from scratch:
+    1. Use create_resume with MAC JSON structure to store CV data
+    2. Use generate_pdf to create the final Europass PDF
     
     The internal format is MAC (Manfred Awesomic CV) JSON schema.
     See: https://github.com/getmanfred/mac
@@ -55,6 +70,9 @@ mcp = FastMCP(
 
 # Storage for resumes by ID (session-safe)
 _resumes: dict[str, dict[str, Any]] = {}
+
+# Storage for raw Europass XML by resume ID (bypasses MAC conversion)
+_raw_europass_xml: dict[str, str] = {}
 
 # Maximum number of resumes to keep in memory (LRU-style cleanup)
 _MAX_RESUMES = 50
@@ -98,6 +116,742 @@ def parse_document(file_path: str) -> dict[str, Any] | str:
             "message": f"Failed to parse document: {str(e)}",
             "file_path": file_path
         }
+
+
+def _extract_europass_xml_from_pdf(pdf_path: Path) -> str | None:
+    """
+    Extract embedded Europass XML from a PDF file.
+    
+    Europass PDFs generated from europa.eu contain an embedded XML attachment
+    (typically named 'attachment.xml') with the full CV data in HR-XML 3.0 format.
+    
+    Args:
+        pdf_path: Path to the Europass PDF file
+        
+    Returns:
+        The XML content as string, or None if no XML attachment found
+    """
+    try:
+        reader = pypdf.PdfReader(str(pdf_path))
+        
+        if not reader.attachments:
+            logger.warning(f"No attachments found in PDF: {pdf_path}")
+            return None
+        
+        # Look for XML attachment (Europass uses 'attachment.xml')
+        for name, data_list in reader.attachments.items():
+            if name.lower().endswith('.xml'):
+                # Take the first XML attachment
+                xml_bytes = data_list[0]
+                xml_content = xml_bytes.decode('utf-8')
+                logger.info(f"Extracted XML from PDF: {name} ({len(xml_bytes)} bytes)")
+                return xml_content
+        
+        logger.warning(f"No XML attachment found in PDF attachments: {list(reader.attachments.keys())}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to extract XML from PDF {pdf_path}: {e}")
+        return None
+
+
+def _europass_xml_to_mac(xml_content: str) -> dict[str, Any]:
+    """
+    Parse Europass XML and convert to MAC JSON format.
+    
+    This extracts ALL data from the XML including rich descriptions, preserving
+    everything in the MAC structure for later editing or conversion back to XML.
+    
+    The key insight is that MAC can hold MORE data than Europass (Europass is a subset of MAC).
+    We store:
+    - Full HTML descriptions in roles[].challenges or a dedicated field
+    - Organization names exactly as they appear
+    - All location details (postal code, address, city)
+    - Education descriptions
+    """
+    import re
+    import html
+    from xml.etree import ElementTree as ET
+    
+    # Parse XML
+    root = ET.fromstring(xml_content)
+    
+    # Define namespaces
+    ns = {
+        'ep': 'http://www.europass.eu/1.0',
+        'hr': 'http://www.hr-xml.org/3',
+        'oa': 'http://www.openapplications.org/oagis/9',
+        'eures': 'http://www.europass_eures.eu/1.0',
+    }
+    
+    def get_text(elem, path, default=""):
+        """Get text from element path, handling namespaces."""
+        if elem is None:
+            return default
+        found = elem.find(path, ns)
+        return found.text.strip() if found is not None and found.text else default
+    
+    def unescape_html(text):
+        """Unescape HTML entities in descriptions."""
+        if not text:
+            return text
+        return html.unescape(text)
+    
+    # Extract person info from CandidatePerson
+    candidate_person = root.find('.//ep:CandidatePerson', ns)
+    
+    given_name = get_text(candidate_person, 'ep:PersonName/oa:GivenName')
+    family_name = get_text(candidate_person, 'ep:PersonName/hr:FamilyName')
+    birthday = get_text(candidate_person, 'hr:BirthDate')
+    nationality = get_text(candidate_person, 'ep:NationalityCode')
+    
+    # Extract contact info
+    email = ""
+    phone = ""
+    phone_country = ""
+    address_line = ""
+    city = ""
+    postal_code = ""
+    country_code = ""
+    
+    for comm in candidate_person.findall('.//ep:Communication', ns) if candidate_person is not None else []:
+        channel = get_text(comm, 'ep:ChannelCode')
+        if channel == 'Email':
+            email = get_text(comm, 'oa:URI')
+        elif channel == 'Telephone':
+            phone_country = get_text(comm, 'ep:CountryDialing')
+            phone = get_text(comm, 'oa:DialNumber')
+        else:
+            # Address
+            addr = comm.find('ep:Address', ns)
+            if addr is not None:
+                address_line = get_text(addr, 'oa:AddressLine')
+                city = get_text(addr, 'oa:CityName')
+                postal_code = get_text(addr, 'oa:PostalCode')
+                country_code = get_text(addr, 'ep:CountryCode')
+    
+    # Build profile location
+    location = {}
+    if country_code:
+        location["country"] = country_code.upper() if len(country_code) == 2 else country_code
+    if city:
+        location["municipality"] = city
+    if postal_code:
+        location["postalCode"] = postal_code
+    if address_line:
+        location["address"] = address_line
+    
+    # Extract jobs from EmploymentHistory
+    jobs = []
+    employment_history = root.find('.//ep:EmploymentHistory', ns)
+    
+    if employment_history is not None:
+        for employer in employment_history.findall('ep:EmployerHistory', ns):
+            org_name = get_text(employer, 'hr:OrganizationName')
+            
+            # Organization location
+            org_city = ""
+            org_country = ""
+            org_contact = employer.find('ep:OrganizationContact', ns)
+            if org_contact is not None:
+                org_addr = org_contact.find('.//ep:Address', ns)
+                if org_addr is not None:
+                    org_city = get_text(org_addr, 'oa:CityName')
+                    org_country = get_text(org_addr, 'ep:CountryCode')
+            
+            org_location = {}
+            if org_country:
+                org_location["country"] = org_country.upper() if len(org_country) == 2 else org_country
+            if org_city:
+                org_location["municipality"] = org_city
+            
+            # Extract roles/positions
+            roles = []
+            for position in employer.findall('ep:PositionHistory', ns):
+                title = get_text(position, 'ep:PositionTitle')
+                
+                # Employment period
+                emp_period = position.find('eures:EmploymentPeriod', ns)
+                start_date = ""
+                end_date = ""
+                is_current = False
+                
+                if emp_period is not None:
+                    start_elem = emp_period.find('eures:StartDate/hr:FormattedDateTime', ns)
+                    end_elem = emp_period.find('eures:EndDate/hr:FormattedDateTime', ns)
+                    current_elem = emp_period.find('hr:CurrentIndicator', ns)
+                    
+                    if start_elem is not None and start_elem.text:
+                        start_date = start_elem.text.strip()
+                    if end_elem is not None and end_elem.text:
+                        end_date = end_elem.text.strip()
+                    if current_elem is not None and current_elem.text:
+                        is_current = current_elem.text.lower() == 'true'
+                
+                # Description - this is the RICH content with HTML
+                description_raw = get_text(position, 'oa:Description')
+                description = unescape_html(description_raw)
+                
+                # City from position
+                pos_city = get_text(position, 'ep:City')
+                pos_country = get_text(position, 'ep:Country')
+                
+                # Build role - store full description in challenges
+                role = {
+                    "name": title,
+                    "startDate": start_date,
+                }
+                
+                if end_date and not is_current:
+                    role["finishDate"] = end_date
+                
+                # Store the full HTML description - this is key!
+                # MAC doesn't have a direct "fullDescription" in the schema, 
+                # but we can use the notes field or store in challenges
+                if description:
+                    # Store as a single challenge with the full description
+                    role["challenges"] = [{"description": description}]
+                    # Also store in notes for backup
+                    role["notes"] = description
+                
+                roles.append(role)
+            
+            job = {
+                "organization": {
+                    "name": org_name,
+                }
+            }
+            if org_location:
+                job["organization"]["location"] = org_location
+            if roles:
+                job["roles"] = roles
+            
+            jobs.append(job)
+    
+    # Extract education from EducationHistory
+    studies = []
+    education_history = root.find('.//ep:EducationHistory', ns)
+    
+    if education_history is not None:
+        for edu in education_history.findall('ep:EducationOrganizationAttendance', ns):
+            inst_name = get_text(edu, 'hr:OrganizationName')
+            
+            # Institution location
+            inst_city = ""
+            inst_country = ""
+            inst_url = ""
+            inst_contact = edu.find('ep:OrganizationContact', ns)
+            if inst_contact is not None:
+                for comm in inst_contact.findall('ep:Communication', ns):
+                    channel = get_text(comm, 'ep:ChannelCode')
+                    if channel == 'Web':
+                        inst_url = get_text(comm, 'oa:URI')
+                    else:
+                        addr = comm.find('ep:Address', ns)
+                        if addr is not None:
+                            inst_city = get_text(addr, 'oa:CityName')
+                            inst_country = get_text(addr, 'ep:CountryCode')
+            
+            # Attendance period
+            att_period = edu.find('ep:AttendancePeriod', ns)
+            start_date = ""
+            end_date = ""
+            ongoing = False
+            
+            if att_period is not None:
+                start_elem = att_period.find('ep:StartDate/hr:FormattedDateTime', ns)
+                end_elem = att_period.find('ep:EndDate/hr:FormattedDateTime', ns)
+                ongoing_elem = att_period.find('ep:Ongoing', ns)
+                
+                if start_elem is not None and start_elem.text:
+                    start_date = start_elem.text.strip()
+                if end_elem is not None and end_elem.text:
+                    end_date = end_elem.text.strip()
+                if ongoing_elem is not None and ongoing_elem.text:
+                    ongoing = ongoing_elem.text.lower() == 'true'
+            
+            # Degree info
+            degree = edu.find('ep:EducationDegree', ns)
+            degree_name = get_text(degree, 'hr:DegreeName') if degree is not None else ""
+            skills_covered = get_text(degree, 'ep:OccupationalSkillsCovered') if degree is not None else ""
+            skills_covered = unescape_html(skills_covered)
+            
+            # Build study entry
+            # Infer studyType from name/institution:
+            # - "Certified" or short duration (same start/end) → certification
+            # - Otherwise → officialDegree
+            is_certification = (
+                "certif" in degree_name.lower() or
+                "safe" in degree_name.lower() or
+                (start_date == end_date and start_date)  # Same month → certification
+            )
+            study = {
+                "studyType": "certification" if is_certification else "officialDegree",
+                "degreeAchieved": not ongoing and bool(end_date),
+                "name": degree_name,
+                "startDate": start_date,
+            }
+            
+            if end_date:
+                study["finishDate"] = end_date
+            
+            if skills_covered:
+                study["description"] = skills_covered
+            
+            institution = {"name": inst_name}
+            if inst_url:
+                institution["URL"] = inst_url
+            if inst_city or inst_country:
+                inst_loc = {}
+                if inst_country:
+                    inst_loc["country"] = inst_country.upper() if len(inst_country) == 2 else inst_country
+                if inst_city:
+                    inst_loc["municipality"] = inst_city
+                institution["location"] = inst_loc
+            
+            study["institution"] = institution
+            studies.append(study)
+    
+    # Extract languages from LanguageSkills (basic listing)
+    languages = []
+    lang_skills = root.find('.//ep:LanguageSkills', ns)
+    if lang_skills is not None:
+        for lang in lang_skills.findall('ep:MotherLanguage', ns):
+            lang_code = get_text(lang, 'ep:LanguageCode')
+            if lang_code:
+                languages.append({
+                    "name": lang_code,
+                    "fullName": lang_code,
+                    "level": "Native or bilingual proficiency"
+                })
+        for lang in lang_skills.findall('ep:ForeignLanguage', ns):
+            lang_code = get_text(lang, 'ep:LanguageCode')
+            if lang_code:
+                languages.append({
+                    "name": lang_code,
+                    "fullName": lang_code,
+                    "level": "Professional working proficiency"
+                })
+    
+    # Extract detailed CEFR scores from PersonQualifications (for round-trip preservation)
+    # These are stored in PersonCompetency elements with TaxonomyID="language"
+    language_cefr_scores = {}  # {lang_code: {dimension: score}}
+    candidate_profile = root.find('.//ep:CandidateProfile', ns)
+    if candidate_profile is not None:
+        person_quals = candidate_profile.find('ep:PersonQualifications', ns)
+        if person_quals is not None:
+            for competency in person_quals.findall('ep:PersonCompetency', ns):
+                # Check if this is a language competency
+                taxonomy_id = get_text(competency, 'hr:TaxonomyID')
+                if taxonomy_id == 'language':
+                    comp_id_elem = competency.find('ep:CompetencyID', ns)
+                    if comp_id_elem is not None and comp_id_elem.text:
+                        lang_code = comp_id_elem.text.strip()
+                        
+                        # Extract all CEFR dimension scores
+                        scores = {}
+                        for dim in competency.findall('eures:CompetencyDimension', ns):
+                            dim_code = get_text(dim, 'hr:CompetencyDimensionTypeCode')
+                            score_text = get_text(dim, 'eures:Score/hr:ScoreText')
+                            if dim_code and score_text:
+                                scores[dim_code] = score_text
+                        
+                        if scores:
+                            language_cefr_scores[lang_code] = scores
+                            
+                            # Check if this language is in our list, add CEFR scores
+                            for lang in languages:
+                                if lang.get("name", "").lower() == lang_code.lower():
+                                    lang["cefrScores"] = scores
+                                    break
+                            else:
+                                # Language not in basic list, add it with CEFR scores
+                                languages.append({
+                                    "name": lang_code,
+                                    "fullName": lang_code,
+                                    "level": "Professional working proficiency",
+                                    "cefrScores": scores
+                                })
+    
+    # Extract profile picture from eures:Attachment
+    profile_picture = ""
+    if candidate_profile is not None:
+        for attachment in candidate_profile.findall('eures:Attachment', ns):
+            file_type = get_text(attachment, 'oa:FileType')
+            instructions = get_text(attachment, 'hr:Instructions')
+            if file_type == 'photo' or instructions == 'ProfilePicture':
+                embedded_data = get_text(attachment, 'oa:EmbeddedData')
+                if embedded_data:
+                    profile_picture = embedded_data
+                    break
+    
+    # Build complete MAC structure
+    mac = {
+        "$schema": "https://raw.githubusercontent.com/getmanfred/mac/v0.5/schema/schema.json",
+        "settings": {
+            "language": "fr",  # Could extract from XML languageCode
+        },
+        "aboutMe": {
+            "profile": {
+                "name": given_name,
+                "surnames": family_name,
+            }
+        },
+    }
+    
+    if birthday:
+        mac["aboutMe"]["profile"]["birthday"] = birthday
+    if location:
+        mac["aboutMe"]["profile"]["location"] = location
+    
+    # Contact info
+    if email or phone:
+        mac["careerPreferences"] = {"contact": {}}
+        if email:
+            mac["careerPreferences"]["contact"]["contactMails"] = [email]
+        if phone:
+            full_phone = f"+{phone_country}{phone}" if phone_country else phone
+            mac["careerPreferences"]["contact"]["phoneNumbers"] = [full_phone]
+    
+    # Experience
+    if jobs:
+        mac["experience"] = {"jobs": jobs}
+    
+    # Knowledge
+    knowledge = {}
+    if studies:
+        knowledge["studies"] = studies
+    if languages:
+        knowledge["languages"] = languages
+    if knowledge:
+        mac["knowledge"] = knowledge
+    
+    # Profile picture - stored at top level for converter to find
+    if profile_picture:
+        mac["profilePicture"] = profile_picture
+    
+    return mac
+
+
+@mcp.tool
+def import_cv(file_path: str, parse_to_mac: bool = True) -> dict[str, Any]:
+    """
+    Import a CV from PDF, DOCX, or XML file for editing and PDF generation.
+    
+    Uses MAC JSON as the IR (Intermediate Representation) - all formats
+    are converted to this unified schema before Europass XML generation.
+    
+    Supported formats:
+    
+    1. **PDF (Europass)** - Extracts embedded XML from Europass PDFs
+       - PDFs from europa.eu contain embedded XML attachment
+       - Preserves all structured data (jobs, education, skills, photo, CEFR scores)
+       - Returns resume_id for immediate PDF generation
+    
+    2. **PDF (other)** - LLM-based structured extraction
+       - If no embedded XML, uses trustcall for structured extraction
+       - Requires: pip install trustcall langchain-openai
+       - Falls back to raw text if LLM unavailable
+    
+    3. **DOCX** - LLM-based structured extraction
+       - Extracts text, then uses LLM to populate MAC schema
+       - Uses trustcall for reliable structured output
+       - Falls back to raw text if LLM unavailable
+    
+    4. **XML (Europass)** - Direct HR-XML 3.0 import
+       - Full content preservation
+    
+    Modes for PDF (Europass) / XML:
+    
+    - parse_to_mac=True (default): Parse to MAC JSON for editing
+    - parse_to_mac=False: Use XML directly (exact preservation, no editing)
+    
+    Args:
+        file_path: Absolute path to PDF, DOCX, or XML file
+        parse_to_mac: If True, parse to MAC for editing. If False, use XML directly.
+        
+    Returns:
+        - resume_id: ID for use with generate_pdf
+        - mac_json: MAC JSON structure (for inspection/editing)
+        - summary: Quick overview of extracted data
+    """
+    global _resumes, _raw_europass_xml
+    import re
+    
+    path = Path(file_path)
+    
+    if not path.exists():
+        return {
+            "status": "error",
+            "message": f"File not found: {file_path}"
+        }
+    
+    if not path.is_file():
+        return {
+            "status": "error",
+            "message": f"Path is not a file: {file_path}"
+        }
+    
+    suffix = path.suffix.lower()
+    
+    # Handle DOCX - text extraction only
+    # Handle DOCX - extract text and optionally use LLM for structured extraction
+    if suffix == '.docx':
+        try:
+            md = MarkItDown()
+            result = md.convert(str(path))
+            text_content = result.text_content
+            
+            # Try structured extraction if available
+            try:
+                from .cv_extractor import extract_cv_from_text, is_extraction_available
+                
+                if is_extraction_available():
+                    logger.info(f"Extracting structured CV from DOCX: {path.name}")
+                    extraction_result = extract_cv_from_text(text_content)
+                    
+                    if extraction_result.get("status") == "success":
+                        # Store the MAC JSON
+                        resume_id = str(uuid4())[:8]
+                        mac = extraction_result["mac_json"]
+                        mac["_imported_from"] = str(file_path)
+                        _resumes[resume_id] = mac
+                        
+                        profile = mac.get("aboutMe", {}).get("profile", {})
+                        full_name = f"{profile.get('name', '')} {profile.get('surnames', '')}".strip()
+                        jobs = mac.get("experience", {}).get("jobs", [])
+                        studies = mac.get("knowledge", {}).get("studies", [])
+                        
+                        logger.info(f"DOCX extracted to MAC: {resume_id} for {full_name} ({len(jobs)} jobs, {len(studies)} education)")
+                        
+                        return {
+                            "status": "success",
+                            "message": f"DOCX parsed and structured for {full_name}",
+                            "resume_id": resume_id,
+                            "format": "docx",
+                            "mode": "extracted",
+                            "summary": {
+                                "name": full_name,
+                                "source_file": str(path),
+                                "jobs_count": len(jobs),
+                                "education_count": len(studies),
+                            },
+                            "mac_json": mac,
+                            "note": "CV extracted using LLM. Review and edit with create_resume if needed."
+                        }
+                    else:
+                        logger.warning(f"LLM extraction failed: {extraction_result.get('message')}")
+            except ImportError:
+                pass  # cv_extractor not available, fall back to text
+            
+            # Fall back to returning raw text
+            return {
+                "status": "partial",
+                "message": f"DOCX parsed: {path.name}",
+                "format": "docx",
+                "text_content": text_content,
+                "note": "LLM extraction not available. Use create_resume with MAC JSON to store this CV. Install trustcall for automatic extraction: pip install trustcall langchain-openai"
+            }
+        except Exception as e:
+            logger.error(f"Failed to parse DOCX {file_path}: {e}")
+            return {
+                "status": "error",
+                "message": f"Failed to parse DOCX: {str(e)}"
+            }
+    
+    # Handle PDF - extract embedded XML
+    if suffix == '.pdf':
+        xml_content = _extract_europass_xml_from_pdf(path)
+        
+        if xml_content is None:
+            # No embedded XML - try text extraction + LLM as fallback
+            try:
+                md = MarkItDown()
+                result = md.convert(str(path))
+                text_content = result.text_content
+                
+                # Try structured extraction if available
+                try:
+                    from .cv_extractor import extract_cv_from_text, is_extraction_available
+                    
+                    if is_extraction_available():
+                        logger.info(f"Extracting structured CV from non-Europass PDF: {path.name}")
+                        extraction_result = extract_cv_from_text(text_content)
+                        
+                        if extraction_result.get("status") == "success":
+                            resume_id = str(uuid4())[:8]
+                            mac = extraction_result["mac_json"]
+                            mac["_imported_from"] = str(file_path)
+                            _resumes[resume_id] = mac
+                            
+                            profile = mac.get("aboutMe", {}).get("profile", {})
+                            full_name = f"{profile.get('name', '')} {profile.get('surnames', '')}".strip()
+                            jobs = mac.get("experience", {}).get("jobs", [])
+                            studies = mac.get("knowledge", {}).get("studies", [])
+                            
+                            return {
+                                "status": "success",
+                                "message": f"PDF parsed and structured for {full_name}",
+                                "resume_id": resume_id,
+                                "format": "pdf",
+                                "mode": "extracted",
+                                "summary": {
+                                    "name": full_name,
+                                    "source_file": str(path),
+                                    "jobs_count": len(jobs),
+                                    "education_count": len(studies),
+                                },
+                                "mac_json": mac,
+                                "note": "Non-Europass PDF. CV extracted using LLM."
+                            }
+                except ImportError:
+                    pass
+                
+                return {
+                    "status": "partial",
+                    "message": f"PDF has no embedded Europass XML. Extracted text content instead.",
+                    "format": "pdf_text",
+                    "text_content": text_content,
+                    "note": "Not a Europass PDF. Install trustcall for LLM extraction: pip install trustcall langchain-openai"
+                }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "message": f"Failed to extract content from PDF: {str(e)}"
+                }
+        
+        # XML extracted successfully - continue processing as XML
+        logger.info(f"Extracted Europass XML from PDF: {path.name}")
+    
+    # Handle XML - read directly
+    elif suffix == '.xml':
+        try:
+            xml_content = path.read_text(encoding='utf-8')
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to read XML file: {str(e)}"
+            }
+    else:
+        return {
+            "status": "error",
+            "message": f"Unsupported file format: {suffix}. Supported: .pdf, .docx, .xml"
+        }
+    
+    # Validate XML content
+    if 'europass' not in xml_content.lower() and 'Candidate' not in xml_content:
+        return {
+            "status": "error",
+            "message": "File does not appear to be a valid Europass XML (missing Europass namespace or Candidate element)"
+        }
+    
+    try:
+        # Generate unique ID
+        resume_id = str(uuid4())[:8]
+        
+        # Always store the raw XML for direct use option
+        _raw_europass_xml[resume_id] = xml_content
+        
+        if parse_to_mac:
+            # Parse XML to MAC JSON - allows editing
+            mac = _europass_xml_to_mac(xml_content)
+            mac["_imported_from"] = str(file_path)
+            _resumes[resume_id] = mac
+            
+            profile = mac.get("aboutMe", {}).get("profile", {})
+            full_name = f"{profile.get('name', '')} {profile.get('surnames', '')}".strip()
+            
+            jobs = mac.get("experience", {}).get("jobs", [])
+            studies = mac.get("knowledge", {}).get("studies", [])
+            
+            logger.info(f"Europass XML parsed to MAC: {resume_id} for {full_name} ({len(jobs)} jobs, {len(studies)} education)")
+            
+            return {
+                "status": "success",
+                "message": f"CV imported and parsed for {full_name}",
+                "resume_id": resume_id,
+                "format": suffix.lstrip('.'),
+                "mode": "parsed",
+                "summary": {
+                    "name": full_name,
+                    "source_file": str(path),
+                    "jobs_count": len(jobs),
+                    "education_count": len(studies),
+                },
+                "mac_json": mac,  # Return for inspection/editing
+                "note": "MAC JSON can be edited via create_resume before generate_pdf. Original XML also stored as backup."
+            }
+        else:
+            # Direct mode - use XML as-is
+            # Extract name from XML for summary
+            given_name_match = re.search(r'<oa:GivenName>([^<]+)</oa:GivenName>', xml_content)
+            family_name_match = re.search(r'<hr:FamilyName>([^<]+)</hr:FamilyName>', xml_content)
+            
+            given_name = given_name_match.group(1).strip() if given_name_match else "Unknown"
+            family_name = family_name_match.group(1).strip() if family_name_match else "Unknown"
+            full_name = f"{given_name} {family_name}"
+            
+            # Count jobs and education entries
+            jobs_count = xml_content.count('<EmployerHistory>')
+            education_count = xml_content.count('<EducationOrganizationAttendance>')
+            
+            # Create minimal MAC structure for compatibility
+            _resumes[resume_id] = {
+                "$schema": "https://raw.githubusercontent.com/getmanfred/mac/v0.5/schema/schema.json",
+                "settings": {"language": "fr"},
+                "aboutMe": {
+                    "profile": {
+                        "name": given_name,
+                        "surnames": family_name,
+                        "title": "(Imported from Europass XML - direct mode)",
+                    }
+                },
+                "_imported_from": str(file_path),
+                "_is_raw_europass": True
+            }
+            
+            logger.info(f"Europass XML imported (direct): {resume_id} for {full_name} ({jobs_count} jobs, {education_count} education)")
+            
+            return {
+                "status": "success",
+                "message": f"CV imported (direct mode) for {full_name}",
+                "resume_id": resume_id,
+                "format": suffix.lstrip('.'),
+                "mode": "direct",
+                "summary": {
+                    "name": full_name,
+                    "source_file": str(path),
+                    "jobs_count": jobs_count,
+                    "education_count": education_count,
+                },
+                "note": "Original XML will be used directly by generate_pdf. No editing possible in this mode."
+            }
+        
+        # LRU cleanup
+        if len(_resumes) > _MAX_RESUMES:
+            oldest_id = next(iter(_resumes))
+            del _resumes[oldest_id]
+            if oldest_id in _raw_europass_xml:
+                del _raw_europass_xml[oldest_id]
+        
+    except Exception as e:
+        logger.error(f"Failed to import CV {file_path}: {e}")
+        return {
+            "status": "error",
+            "message": f"Failed to import CV: {str(e)}",
+            "file_path": file_path
+        }
+
+
+# Legacy alias for backward compatibility
+@mcp.tool
+def import_europass_xml(file_path: str, parse_to_mac: bool = True) -> dict[str, Any]:
+    """
+    Legacy alias for import_cv. Use import_cv instead.
+    
+    Redirects to import_cv which supports PDF, DOCX, and XML files.
+    """
+    return import_cv(file_path, parse_to_mac)
 
 
 @mcp.tool
@@ -205,7 +959,9 @@ def create_resume(mac_json: dict[str, Any]) -> dict[str, Any]:
     name = f"{profile.get('name', '')} {profile.get('surnames', '')}".strip()
     
     jobs = mac_json.get("experience", {}).get("jobs", [])
-    studies = mac_json.get("knowledge", {}).get("studies", [])
+    # Handle both formats: studies as list OR studies.studiesDetails
+    studies_raw = mac_json.get("knowledge", {}).get("studies", [])
+    studies = studies_raw.get("studiesDetails", []) if isinstance(studies_raw, dict) else studies_raw
     
     return {
         "status": "success",
@@ -227,9 +983,9 @@ def list_resumes() -> dict[str, Any]:
     List all resumes currently stored in memory.
     
     Returns:
-        List of resume IDs with their summaries
+        List of resume IDs with their summaries, including whether they have raw Europass XML
     """
-    global _resumes
+    global _resumes, _raw_europass_xml
     
     resumes_list = []
     for resume_id, mac_json in _resumes.items():
@@ -239,6 +995,8 @@ def list_resumes() -> dict[str, Any]:
             "resume_id": resume_id,
             "name": name,
             "title": profile.get("title", ""),
+            "has_raw_xml": resume_id in _raw_europass_xml,
+            "imported_from": mac_json.get("_imported_from", None),
         })
     
     return {
@@ -272,10 +1030,69 @@ def delete_resume(resume_id: str) -> dict[str, Any]:
     
     del _resumes[resume_id]
     
+    # Also clean up raw XML if present
+    if resume_id in _raw_europass_xml:
+        del _raw_europass_xml[resume_id]
+    
     return {
         "status": "success",
         "message": f"Resume for {name} (ID: {resume_id}) deleted.",
         "remaining_count": len(_resumes)
+    }
+
+
+@mcp.tool
+def update_resume(resume_id: str, mac_json: dict[str, Any], use_mac_conversion: bool = True) -> dict[str, Any]:
+    """
+    Update an existing resume with new MAC JSON data.
+    
+    When updating a resume that was imported from Europass XML, you can choose whether
+    to use MAC→XML conversion or keep the original XML.
+    
+    Args:
+        resume_id: ID of the resume to update
+        mac_json: New MAC JSON data (can be partial update)
+        use_mac_conversion: If True, clears raw XML so generate_pdf uses MAC conversion.
+                           If False, keeps original XML for generate_pdf.
+        
+    Returns:
+        Confirmation of update
+    """
+    global _resumes, _raw_europass_xml
+    
+    if resume_id not in _resumes:
+        return {
+            "status": "error",
+            "message": f"Resume ID '{resume_id}' not found."
+        }
+    
+    # Deep merge the new data with existing
+    existing = _resumes[resume_id]
+    
+    # Simple merge: update top-level keys
+    for key, value in mac_json.items():
+        if isinstance(value, dict) and isinstance(existing.get(key), dict):
+            # Merge nested dicts
+            existing[key].update(value)
+        else:
+            existing[key] = value
+    
+    _resumes[resume_id] = existing
+    
+    # Clear raw XML if user wants MAC conversion
+    if use_mac_conversion and resume_id in _raw_europass_xml:
+        del _raw_europass_xml[resume_id]
+        logger.info(f"Cleared raw XML for {resume_id}, will use MAC conversion")
+    
+    profile = existing.get("aboutMe", {}).get("profile", {})
+    name = f"{profile.get('name', '')} {profile.get('surnames', '')}".strip()
+    
+    return {
+        "status": "success",
+        "message": f"Resume for {name} updated.",
+        "resume_id": resume_id,
+        "use_mac_conversion": use_mac_conversion,
+        "has_raw_xml": resume_id in _raw_europass_xml
     }
 
 
@@ -290,6 +1107,23 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
     experience = mac.get("experience", {})
     knowledge = mac.get("knowledge", {})
     settings = mac.get("settings", {})
+    
+    # Profile picture: check profilePicture (base64 data) or avatar (link)
+    profile_picture = mac.get("profilePicture", "")
+    avatar = profile.get("avatar", {})
+    avatar_link = avatar.get("link", "") if isinstance(avatar, dict) else ""
+    
+    # Europass expects the profile picture as: base64(data:image/jpeg;base64,<raw_b64>)
+    # This is a double-encoding: the entire data URI is base64 encoded again
+    if profile_picture:
+        # If profilePicture is raw base64 JPEG data, wrap it in data URI and re-encode
+        if profile_picture.startswith("/9j/") or profile_picture.startswith("iVBOR"):
+            # Determine image type from base64 header
+            img_type = "jpeg" if profile_picture.startswith("/9j/") else "png"
+            data_uri = f"data:image/{img_type};base64,{profile_picture}"
+            # Double-encode: encode the entire data URI as base64
+            import base64
+            profile_picture = base64.b64encode(data_uri.encode("utf-8")).decode("utf-8")
     
     name = profile.get("name", "")
     surnames = profile.get("surnames", "")
@@ -338,9 +1172,9 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
     ])
     
     # CandidatePerson
-    title = profile.get("title", "")
-    description = profile.get("description", "")
-    
+    # Note: PersonTitle and PersonDescription are NOT supported by Europass XML import
+    # The working original XML does not include these elements
+
     xml_parts.extend([
         '    <CandidatePerson>',
         '        <PersonName>',
@@ -348,15 +1182,6 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
         f'            <hr:FamilyName>{escape(surnames)}</hr:FamilyName>',
         '        </PersonName>',
     ])
-    
-    # Professional title
-    if title:
-        xml_parts.append(f'        <hr:PersonTitle>{escape(title)}</hr:PersonTitle>')
-    
-    # Professional summary/description
-    if description:
-        xml_parts.append(f'        <hr:PersonDescription>{escape(description)}</hr:PersonDescription>')
-    
     if email:
         xml_parts.extend([
             '        <Communication>',
@@ -366,43 +1191,57 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
         ])
     
     # Relevant links (LinkedIn, GitHub, etc.)
+    # Note: ChannelCode must be a valid Europass value: Email, Telephone, Web
+    # All URLs should use "Web" as the channel code
     relevant_links = mac.get("aboutMe", {}).get("relevantLinks", [])
     for link in relevant_links:
         url = link.get("URL", "")
-        link_type = link.get("type", "website").lower()
         if url:
             xml_parts.extend([
                 '        <Communication>',
-                f'            <ChannelCode>{escape(link_type.capitalize())}</ChannelCode>',
+                '            <ChannelCode>Web</ChannelCode>',
                 f'            <oa:URI>{escape(url)}</oa:URI>',
                 '        </Communication>',
             ])
     
-    # Phone - handle both dict format and plain string
+    # Phone - use phonenumbers library (Google's libphonenumber) for robust parsing
     if phones:
         phone = phones[0]
+        country_code = ""
+        number = ""
+        
         if isinstance(phone, dict):
-            country_code = phone.get("countryCode", "")
-            number = phone.get("number", "")
+            # Dict format: {"countryCode": "+33", "number": "631092519"}
+            country_code = str(phone.get("countryCode", "")).lstrip("+")
+            number = str(phone.get("number", ""))
         else:
-            # Plain string like "+33631092519" - extract country code
+            # Plain string like "+33631092519" - parse with phonenumbers
             phone_str = str(phone).strip()
-            if phone_str.startswith("+"):
-                # Extract country code (assume 2-3 digits after +)
-                for i in range(2, 5):
-                    if i < len(phone_str) and not phone_str[i].isdigit():
-                        break
-                country_code = phone_str[:i]
-                number = phone_str[i:]
-            else:
-                country_code = ""
-                number = phone_str
+            try:
+                # Parse E.164 format (with +) or attempt with None region
+                parsed = phonenumbers.parse(phone_str, None)
+                country_code = str(parsed.country_code)
+                number = str(parsed.national_number)
+            except phonenumbers.NumberParseException:
+                # Fallback: try to extract manually if parsing fails
+                if phone_str.startswith("+"):
+                    # Remove + and try to split (assume 2-digit country code)
+                    digits = phone_str[1:]
+                    country_code = digits[:2]
+                    number = digits[2:]
+                else:
+                    number = phone_str
+        
+        # Get country code from phone country dialing code
+        phone_country = _phone_country_to_iso(country_code)
+        
         xml_parts.extend([
             '        <Communication>',
             '            <ChannelCode>Telephone</ChannelCode>',
             '            <UseCode>work</UseCode>',
             f'            <CountryDialing>{escape(country_code)}</CountryDialing>',
             f'            <oa:DialNumber>{escape(number)}</oa:DialNumber>',
+            f'            <CountryCode>{phone_country}</CountryCode>',
             '        </Communication>',
         ])
     
@@ -411,15 +1250,24 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
         city = location.get("municipality", "")
         country = location.get("country", "")
         region = location.get("region", "")
+        postal_code = location.get("postalCode", "")
+        address_line = location.get("address", "")  # From parsed Europass XML
         country_code = _country_to_code(country)
+        
+        # Use address if available, fallback to region
+        display_address = address_line if address_line else region
         
         xml_parts.extend([
             '        <Communication>',
             '            <UseCode>home</UseCode>',
             '            <Address type="home">',
-            f'                <oa:AddressLine>{escape(region)}</oa:AddressLine>',
+            f'                <oa:AddressLine>{escape(display_address)}</oa:AddressLine>',
             f'                <oa:CityName>{escape(city)}</oa:CityName>',
             f'                <CountryCode>{country_code}</CountryCode>',
+        ])
+        if postal_code:
+            xml_parts.append(f'                <oa:PostalCode>{escape(postal_code)}</oa:PostalCode>')
+        xml_parts.extend([
             '            </Address>',
             '        </Communication>',
         ])
@@ -475,9 +1323,15 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
                 finish_date = _validate_date(role.get("finishDate", ""))
                 is_current = not finish_date
                 
-                # Build description from challenges
-                challenges = role.get("challenges", [])
-                description = _build_html_description(challenges)
+                # Use fullDescription if available (Europass rich HTML), 
+                # then try notes (where we also store imported descriptions),
+                # finally fallback to building from challenges
+                description = role.get("fullDescription", "")
+                if not description:
+                    description = role.get("notes", "")
+                if not description:
+                    challenges = role.get("challenges", [])
+                    description = _build_html_description(challenges)
                 
                 xml_parts.extend([
                     '            <EmployerHistory>',
@@ -515,18 +1369,31 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
                     f'                        <hr:CurrentIndicator>{"true" if is_current else "false"}</hr:CurrentIndicator>',
                     '                    </eures:EmploymentPeriod>',
                     f'                    <oa:Description>{escape(description)}</oa:Description>',
+                ])
+                # Add City and Country inside PositionHistory (required by Europass)
+                if org_city:
+                    xml_parts.append(f'                    <City>{escape(org_city)}</City>')
+                if org_country:
+                    xml_parts.append(f'                    <Country>{org_country}</Country>')
+                xml_parts.extend([
                     '                </PositionHistory>',
                     '            </EmployerHistory>',
                 ])
         
         xml_parts.append('        </EmploymentHistory>')
     
-    # Education History (exclude certifications - they go in Certifications section)
-    studies = knowledge.get("studies", [])
-    education_studies = [s for s in studies if s.get("studyType") != "certification"]
-    if education_studies:
+    # Education History - Europass puts ALL education here (degrees + certifications)
+    # The separate Certifications section is optional and often empty
+    # Handle both formats: studies as list OR studies.studiesDetails
+    studies_raw = knowledge.get("studies", [])
+    if isinstance(studies_raw, dict):
+        studies = studies_raw.get("studiesDetails", [])
+    else:
+        studies = studies_raw
+    # Include ALL studies (both education and certifications go in EducationHistory in Europass)
+    if studies:
         xml_parts.append('        <EducationHistory>')
-        for study in education_studies:
+        for study in studies:
             institution = study.get("institution", {})
             inst_name = institution.get("name", "")
             inst_url = institution.get("URL", "")
@@ -591,6 +1458,9 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
         
         xml_parts.append('        </EducationHistory>')
     
+    # Licenses section (required placeholder for Europass compatibility)
+    xml_parts.append('        <eures:Licenses />')
+    
     # Certifications (from studies with type "certification")
     certifications = [s for s in studies if s.get("studyType") == "certification"]
     if certifications:
@@ -610,12 +1480,11 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
             if description:
                 xml_parts.append(f'                <hr:CertificationDescription>{escape(description)}</hr:CertificationDescription>')
             
+            # CertificationDate is required even if empty
+            xml_parts.append('                <hr:CertificationDate>')
             if date:
-                xml_parts.extend([
-                    '                <hr:CertificationDate>',
-                    f'                    <hr:FormattedDateTime>{date}</hr:FormattedDateTime>',
-                    '                </hr:CertificationDate>',
-                ])
+                xml_parts.append(f'                    <hr:FormattedDateTime>{date}</hr:FormattedDateTime>')
+            xml_parts.append('                </hr:CertificationDate>')
             
             xml_parts.append('            </Certification>')
         
@@ -626,42 +1495,96 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
     if languages:
         xml_parts.append('        <PersonQualifications>')
         for lang in languages:
-            lang_name = lang.get("name", "").lower()[:3]
-            level = _level_to_cef(lang.get("level", ""))
+            lang_name = lang.get("name", "").lower()
+            # Map language names to ISO 639-2/B codes (used by Europass)
+            lang_code = _language_to_iso639b(lang_name)
+            default_level = _level_to_cef(lang.get("level", ""))
+            
+            # Get preserved CEFR scores if available, otherwise use default level for all
+            cefr_scores = lang.get("cefrScores", {})
             
             xml_parts.extend([
                 '            <PersonCompetency>',
-                f'                <CompetencyID schemeName="NORMAL">{lang_name}</CompetencyID>',
+                f'                <CompetencyID schemeName="NORMAL">{lang_code}</CompetencyID>',
                 '                <hr:TaxonomyID>language</hr:TaxonomyID>',
             ])
             
             for dim in ["CEF-Understanding-Listening", "CEF-Understanding-Reading", 
                        "CEF-Speaking-Interaction", "CEF-Speaking-Production", "CEF-Writing-Production"]:
+                # Use preserved score if available, otherwise use default
+                score = cefr_scores.get(dim, default_level)
                 xml_parts.extend([
                     '                <eures:CompetencyDimension>',
                     f'                    <hr:CompetencyDimensionTypeCode>{dim}</hr:CompetencyDimensionTypeCode>',
                     '                    <eures:Score>',
-                    f'                        <hr:ScoreText>{level}</hr:ScoreText>',
+                    f'                        <hr:ScoreText>{score}</hr:ScoreText>',
                     '                    </eures:Score>',
                     '                </eures:CompetencyDimension>',
                 ])
             
             xml_parts.append('            </PersonCompetency>')
         
-        # Add hard and soft skills using helper
-        _add_skills_to_xml(xml_parts, knowledge)
+        # NOTE: Hard/soft skills removed - Europass only supports language competencies
+        # with schemeName="NORMAL" and TaxonomyID="language". Using HARDSKILL/SOFTSKILL
+        # causes the Europass parser to fail silently.
+        # _add_skills_to_xml(xml_parts, knowledge)
         
         xml_parts.append('        </PersonQualifications>')
     
-    # If no languages but we have skills, still output them
-    if not languages and (knowledge.get("hardSkills") or knowledge.get("softSkills")):
-        xml_parts.append('        <PersonQualifications>')
-        _add_skills_to_xml(xml_parts, knowledge)
-        xml_parts.append('        </PersonQualifications>')
+    # NOTE: Removed skills-only section - Europass doesn't support HARDSKILL/SOFTSKILL
+    # if not languages and (knowledge.get("hardSkills") or knowledge.get("softSkills")):
+    #     xml_parts.append('        <PersonQualifications>')
+    #     _add_skills_to_xml(xml_parts, knowledge)
+    #     xml_parts.append('        </PersonQualifications>')
     
+    xml_parts.append('        <EmploymentReferences />')
+    
+    # Add profile picture attachment if available
+    if profile_picture:
+        xml_parts.extend([
+            '        <eures:Attachment>',
+            f'            <oa:EmbeddedData>{profile_picture}</oa:EmbeddedData>',
+            '            <oa:FileType>photo</oa:FileType>',
+            '            <hr:Instructions>ProfilePicture</hr:Instructions>',
+            '        </eures:Attachment>',
+        ])
+    
+    # Empty placeholder sections for Europass compatibility
     xml_parts.extend([
-        '        <EmploymentReferences />',
-        '    </CandidateProfile>',
+        '        <CreativeWorks />',
+        '        <Projects />',
+        '        <SocialAndPoliticalActivities />',
+        '        <Skills />',
+        '        <NetworksAndMemberships />',
+        '        <ConferencesAndSeminars />',
+        '        <VoluntaryWorks />',
+        '        <CourseCertifications />',
+    ])
+    
+    xml_parts.append('    </CandidateProfile>')
+    
+    # RenderingInformation section for template settings
+    xml_parts.extend([
+        '    <RenderingInformation>',
+        '        <Design>',
+        '            <Template>Template3</Template>',
+        '            <Color>Default</Color>',
+        '            <FontSize>Medium</FontSize>',
+        '            <Logo>FirstPage</Logo>',
+        '            <PageNumbers>false</PageNumbers>',
+        '            <SectionsOrder>',
+        '                <Section>',
+        '                    <Title>work-experience</Title>',
+        '                </Section>',
+        '                <Section>',
+        '                    <Title>education-training</Title>',
+        '                </Section>',
+        '                <Section>',
+        '                    <Title>language</Title>',
+        '                </Section>',
+        '            </SectionsOrder>',
+        '        </Design>',
+        '    </RenderingInformation>',
         '</Candidate>',
     ])
     
@@ -669,65 +1592,182 @@ def _mac_to_europass_xml(mac: dict[str, Any]) -> str:
 
 
 def _country_to_code(country: str) -> str:
-    """Convert country name to ISO 2-letter code (uppercase)."""
+    """Convert country name to ISO 2-letter code (lowercase for Europass compatibility)."""
     if not country:
         return ""
     
     country_lower = country.lower().strip()
     
-    # Already a 2-letter code - return uppercase
+    # Already a 2-letter code - return lowercase
     if len(country_lower) == 2:
-        return country_lower.upper()
+        return country_lower
     
     mapping = {
-        # Full names - all uppercase ISO codes
-        "france": "FR",
-        "united states": "US",
-        "united states of america": "US",
-        "usa": "US",
-        "united kingdom": "GB",
-        "uk": "GB",
-        "great britain": "GB",
-        "germany": "DE",
-        "deutschland": "DE",
-        "spain": "ES",
-        "españa": "ES",
-        "italy": "IT",
-        "italia": "IT",
-        "belgium": "BE",
-        "belgique": "BE",
-        "netherlands": "NL",
-        "pays-bas": "NL",
-        "switzerland": "CH",
-        "suisse": "CH",
-        "portugal": "PT",
-        "austria": "AT",
-        "poland": "PL",
-        "ireland": "IE",
-        "sweden": "SE",
-        "norway": "NO",
-        "denmark": "DK",
-        "finland": "FI",
-        "greece": "GR",
-        "czech republic": "CZ",
-        "czechia": "CZ",
-        "hungary": "HU",
-        "romania": "RO",
-        "bulgaria": "BG",
-        "croatia": "HR",
-        "slovakia": "SK",
-        "slovenia": "SI",
-        "luxembourg": "LU",
-        "canada": "CA",
-        "australia": "AU",
-        "japan": "JP",
-        "china": "CN",
-        "india": "IN",
-        "brazil": "BR",
-        "mexico": "MX",
+        # Full names - all lowercase ISO codes for Europass
+        "france": "fr",
+        "united states": "us",
+        "united states of america": "us",
+        "usa": "us",
+        "united kingdom": "gb",
+        "uk": "gb",
+        "great britain": "gb",
+        "germany": "de",
+        "deutschland": "de",
+        "spain": "es",
+        "españa": "es",
+        "italy": "it",
+        "italia": "it",
+        "belgium": "be",
+        "belgique": "be",
+        "netherlands": "nl",
+        "pays-bas": "nl",
+        "switzerland": "ch",
+        "suisse": "ch",
+        "portugal": "pt",
+        "austria": "at",
+        "poland": "pl",
+        "ireland": "ie",
+        "sweden": "se",
+        "norway": "no",
+        "denmark": "dk",
+        "finland": "fi",
+        "greece": "gr",
+        "czech republic": "cz",
+        "czechia": "cz",
+        "hungary": "hu",
+        "romania": "ro",
+        "bulgaria": "bg",
+        "croatia": "hr",
+        "slovakia": "sk",
+        "slovenia": "si",
+        "luxembourg": "lu",
+        "canada": "ca",
+        "australia": "au",
+        "japan": "jp",
+        "china": "cn",
+        "india": "in",
+        "brazil": "br",
+        "mexico": "mx",
     }
     
     return mapping.get(country_lower, "")
+
+
+def _phone_country_to_iso(country_dialing: str) -> str:
+    """Convert phone country dialing code to ISO 2-letter country code (lowercase)."""
+    mapping = {
+        "1": "us",    # US/Canada - default to US
+        "33": "fr",   # France
+        "44": "gb",   # UK
+        "49": "de",   # Germany
+        "34": "es",   # Spain
+        "39": "it",   # Italy
+        "32": "be",   # Belgium
+        "31": "nl",   # Netherlands
+        "41": "ch",   # Switzerland
+        "351": "pt",  # Portugal
+        "43": "at",   # Austria
+        "48": "pl",   # Poland
+        "353": "ie",  # Ireland
+        "46": "se",   # Sweden
+        "47": "no",   # Norway
+        "45": "dk",   # Denmark
+        "358": "fi",  # Finland
+        "30": "gr",   # Greece
+        "420": "cz",  # Czech Republic
+        "36": "hu",   # Hungary
+        "40": "ro",   # Romania
+        "359": "bg",  # Bulgaria
+        "385": "hr",  # Croatia
+        "421": "sk",  # Slovakia
+        "386": "si",  # Slovenia
+        "352": "lu",  # Luxembourg
+        "61": "au",   # Australia
+        "81": "jp",   # Japan
+        "86": "cn",   # China
+        "91": "in",   # India
+        "55": "br",   # Brazil
+        "52": "mx",   # Mexico
+    }
+    return mapping.get(str(country_dialing), "")
+
+
+def _language_to_iso639b(lang_name: str) -> str:
+    """Convert language name to ISO 639-2/B code (used by Europass)."""
+    # ISO 639-2/B codes (bibliographic, used by Europass)
+    mapping = {
+        # French variations
+        "french": "fre",
+        "français": "fre",
+        "francais": "fre",
+        "fre": "fre",
+        "fra": "fre",
+        "fr": "fre",
+        # English variations
+        "english": "eng",
+        "anglais": "eng",
+        "eng": "eng",
+        "en": "eng",
+        # German variations
+        "german": "ger",
+        "deutsch": "ger",
+        "allemand": "ger",
+        "ger": "ger",
+        "deu": "ger",
+        "de": "ger",
+        # Spanish variations
+        "spanish": "spa",
+        "español": "spa",
+        "espagnol": "spa",
+        "spa": "spa",
+        "es": "spa",
+        # Italian variations
+        "italian": "ita",
+        "italiano": "ita",
+        "italien": "ita",
+        "ita": "ita",
+        "it": "ita",
+        # Portuguese variations
+        "portuguese": "por",
+        "português": "por",
+        "portugais": "por",
+        "por": "por",
+        "pt": "por",
+        # Dutch variations
+        "dutch": "dut",
+        "nederlands": "dut",
+        "néerlandais": "dut",
+        "dut": "dut",
+        "nld": "dut",
+        "nl": "dut",
+        # Chinese variations
+        "chinese": "chi",
+        "中文": "chi",
+        "chinois": "chi",
+        "chi": "chi",
+        "zho": "chi",
+        "zh": "chi",
+        # Japanese variations
+        "japanese": "jpn",
+        "日本語": "jpn",
+        "japonais": "jpn",
+        "jpn": "jpn",
+        "ja": "jpn",
+        # Russian variations
+        "russian": "rus",
+        "русский": "rus",
+        "russe": "rus",
+        "rus": "rus",
+        "ru": "rus",
+        # Arabic variations
+        "arabic": "ara",
+        "العربية": "ara",
+        "arabe": "ara",
+        "ara": "ara",
+        "ar": "ara",
+    }
+    lang_lower = lang_name.lower().strip()
+    return mapping.get(lang_lower, lang_lower[:3] if lang_lower else "")
 
 
 def _level_to_cef(level: str) -> str:
@@ -746,15 +1786,33 @@ def _level_to_cef(level: str) -> str:
 
 
 def _build_html_description(challenges: list[dict]) -> str:
-    """Build HTML description from MAC challenges."""
+    """
+    Build HTML description from MAC challenges.
+    
+    Handles two cases:
+    1. Challenges with plain text descriptions → wraps in <ul><li>
+    2. Single challenge with full HTML (from Europass import) → uses as-is
+    """
     if not challenges:
         return ""
     
+    # If there's exactly one challenge and it already contains HTML tags,
+    # it's likely a full Europass description - use it directly
+    if len(challenges) == 1:
+        desc = challenges[0].get("description", "")
+        if desc and ("<p>" in desc or "<ol>" in desc or "<ul>" in desc or "<li" in desc):
+            return desc  # Already HTML, use as-is
+    
+    # Otherwise, build from multiple challenges
     items = []
     for challenge in challenges:
         desc = challenge.get("description", "")
         if desc:
-            items.append(f"<li>{desc}</li>")
+            # Strip HTML tags if present (simple cleanup)
+            import re
+            clean_desc = re.sub(r'<[^>]+>', '', desc).strip()
+            if clean_desc:
+                items.append(f"<li>{clean_desc}</li>")
     
     if items:
         return f"<ul>{''.join(items)}</ul>"
@@ -844,42 +1902,55 @@ async def _wait_for_network_idle(page: Page, timeout: int = 10000) -> None:
 
 
 async def _handle_resume_dialog(page: Page) -> None:
-    """Handle the 'Resume last CV' dialog if present."""
+    """Handle the initial dialog and select 'Commencer à partir du CV Europass'.
+    
+    This reveals the file input for XML upload.
+    """
     try:
-        resume_btn = page.get_by_role("button", name="Commencer à partir du CV Europass")
+        # First check if there's a "Recommencer" (Start over) button
+        start_over = page.get_by_role("button", name="Recommencer")
         try:
-            await resume_btn.wait_for(state="visible", timeout=3000)
-        except PlaywrightTimeout:
-            return
-        
-        await resume_btn.click()
-        logger.info("  Dismissed 'Resume last CV' prompt")
-        await _wait_for_network_idle(page, timeout=5000)
-        
-        continue_btn = page.get_by_role("button", name="Continuer")
-        try:
-            await continue_btn.wait_for(state="visible", timeout=3000)
-            await continue_btn.click()
-            logger.info("  Clicked 'Continuer'")
+            await start_over.wait_for(state="visible", timeout=3000)
+            await start_over.click()
+            logger.info("  Dismissed 'Resume last CV' prompt")
             await _wait_for_network_idle(page, timeout=5000)
         except PlaywrightTimeout:
             pass
+        
+        # Click "Commencer à partir du CV Europass" to reveal file input
+        europass_btn = page.get_by_role("button", name="Commencer à partir du CV Europass")
+        try:
+            await europass_btn.wait_for(state="visible", timeout=5000)
+            await europass_btn.click()
+            logger.info("  Selected 'Commencer à partir du CV Europass'")
+            await _wait_for_network_idle(page, timeout=5000)
+        except PlaywrightTimeout:
+            logger.debug("  No 'Commencer à partir du CV Europass' button found")
+        
     except Exception as e:
-        logger.debug(f"  No resume dialog or error: {e}")
+        logger.debug(f"  Resume dialog handling error: {e}")
 
 
 async def _upload_xml_file(page: Page, xml_path: Path, timeout: int) -> bool:
-    """Upload XML file using file chooser."""
+    """Upload XML file using file input element.
+    
+    The Europass site now uses a direct file input instead of a button+file chooser.
+    The file input is revealed after clicking 'Commencer à partir du CV Europass'.
+    """
     try:
-        file_button = page.get_by_role("button", name="Sélectionner un fichier")
-        await file_button.wait_for(state="visible", timeout=timeout)
+        # New flow: The file input is directly available after selecting Europass option
+        file_input = page.locator('input[type=file]')
         
-        async with page.expect_file_chooser(timeout=timeout) as fc_info:
-            await file_button.click()
+        # Wait for file input to be available
+        await file_input.wait_for(state="attached", timeout=timeout)
         
-        file_chooser = await fc_info.value
-        await file_chooser.set_files(str(xml_path))
+        # Set the file directly on the input element
+        await file_input.set_input_files(str(xml_path.absolute()))
         
+        # Wait for upload to process
+        await page.wait_for_timeout(2000)
+        
+        # Wait for builder buttons to appear (indicates successful upload)
         builder_button = page.get_by_role("button", name="Try the new CV builder (beta)")
         await builder_button.wait_for(state="visible", timeout=timeout)
         
@@ -1012,15 +2083,24 @@ async def generate_pdf(
     pdf_path = Path(output_path)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Convert MAC to Europass XML
-    europass_xml = _mac_to_europass_xml(resume_data)
+    # Check if we have raw Europass XML (imported via import_europass_xml)
+    # If so, use it directly instead of converting from MAC
+    if resume_id in _raw_europass_xml:
+        europass_xml = _raw_europass_xml[resume_id]
+        logger.info("Using imported Europass XML (preserving original data)")
+        source_type = "imported"
+    else:
+        # Convert MAC to Europass XML
+        europass_xml = _mac_to_europass_xml(resume_data)
+        source_type = "converted"
+    
     xml_path = pdf_path.with_suffix('.xml')
     xml_path.write_text(europass_xml, encoding='utf-8')
     
     logger.info("=" * 60)
     logger.info("Europass CV PDF Generator (Beta Builder)")
     logger.info("=" * 60)
-    logger.info(f"Resume:   {resume_id}")
+    logger.info(f"Resume:   {resume_id} ({source_type})")
     logger.info(f"Input:    {xml_path}")
     logger.info(f"Output:   {pdf_path}")
     logger.info(f"Template: {template}")
@@ -1085,10 +2165,16 @@ async def generate_pdf(
                 
                 # Step 5: Select template
                 logger.info(f"5/7 Selecting template: {template}...")
-                template_select = page.locator("select.ecl-select").first
-                await template_select.wait_for(state="visible", timeout=10000)
-                await template_select.select_option(value=template)
-                logger.info(f"  ✓ Selected template: {template}")
+                # Template combobox - find by label text and use first combobox
+                # The page has multiple comboboxes, template is the first one in "Customise your CV"
+                try:
+                    # Try to find combobox near "Template" label
+                    template_select = page.locator("select, [role='combobox']").first
+                    await template_select.wait_for(state="visible", timeout=10000)
+                    await template_select.select_option(value=template)
+                    logger.info(f"  ✓ Selected template: {template}")
+                except PlaywrightTimeout:
+                    logger.warning(f"  ⚠ Template selector not found, using default")
                 await _wait_for_network_idle(page, timeout=10000)
                 
                 # Step 6: Enter CV name (REQUIRED before download)
