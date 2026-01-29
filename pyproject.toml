@@ -13,9 +13,29 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Core extraction library
 llm = [
     "trustcall>=0.0.35",
+]
+# Provider-specific dependencies
+openai = [
+    "trustcall>=0.0.35",
     "langchain-openai>=1.0",
+]
+google = [
+    "trustcall>=0.0.35",
+    "langchain-google-genai>=2.0",
+]
+anthropic = [
+    "trustcall>=0.0.35",
+    "langchain-anthropic>=0.3",
+]
+# All providers
+llm-all = [
+    "trustcall>=0.0.35",
+    "langchain-openai>=1.0",
+    "langchain-google-genai>=2.0",
+    "langchain-anthropic>=0.3",
 ]
 dev = [
     "pytest",
