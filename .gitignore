@@ -9,3 +9,5 @@ output/
 
 # Input documents (personal CVs)
 input/*
+credentials/
+.hypothesis/
