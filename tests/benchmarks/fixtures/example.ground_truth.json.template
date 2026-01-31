@@ -1,0 +1,39 @@
+{
+  "_description": "Example ground truth template - rename to match your DOCX file",
+  "_note": "For cv_sample.docx, create cv_sample.ground_truth.json",
+  
+  "aboutMe": {
+    "profile": {
+      "name": "John",
+      "surnames": "Doe"
+    }
+  },
+  "experience": {
+    "jobs": [
+      {
+        "organization": {
+          "name": "ACME Corporation"
+        },
+        "type": "Software Engineer"
+      }
+    ]
+  },
+  "knowledge": {
+    "studies": [
+      {
+        "institution": {
+          "name": "University of Example"
+        },
+        "name": "Computer Science"
+      }
+    ],
+    "hardSkills": [
+      {"skill": {"name": "Python"}},
+      {"skill": {"name": "JavaScript"}}
+    ],
+    "languages": [
+      {"language": {"name": "English"}},
+      {"language": {"name": "French"}}
+    ]
+  }
+}
